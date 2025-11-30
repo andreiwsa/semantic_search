@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block title %}Ошибка{% endblock %}
+
+{% block content %}
+<div class="card text-center">
+    <div class="card-header bg-danger text-white">
+        <h3>❌ Ошибка</h3>
+    </div>
+    <div class="card-body">
+        <p class="error">{{ error }}</p>
+        <a href="/" class="btn btn-primary mt-3">
+            <i class="bi bi-arrow-left me-2"></i>Вернуться на главную
+        </a>
+    </div>
+</div>
+{% endblock %}

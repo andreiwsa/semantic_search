@@ -1,0 +1,12 @@
+torch
+sentence-transformers
+faiss-cpu
+flask
+flask-caching
+numpy
+beautifulsoup4
+docx2txt
+python-docx
+PyMuPDF
+FlagEmbedding
+tqdm

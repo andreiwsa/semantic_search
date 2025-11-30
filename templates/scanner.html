@@ -1,0 +1,336 @@
+{% extends "base.html" %}
+
+{% block title %}Создание кэша сканирования{% endblock %}
+
+{% block header_title %}📄 Создание кэша сканирования{% endblock %}
+{% block header_subtitle %}Настройка параметров сканирования документов для семантического поиска{% endblock %}
+
+{% block extra_styles %}
+<style>
+    .config-section {
+        background-color: #f1f8ff;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 15px;
+    }
+    .status-badge {
+        font-size: 0.9em;
+        padding: 5px 10px;
+        border-radius: 12px;
+    }
+    .btn-start {
+        background-color: #28a745;
+        border-color: #28a745;
+    }
+    .btn-stop {
+        background-color: #dc3545;
+        border-color: #dc3545;
+        margin-top: 10px;
+    }
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        gap: 15px;
+        margin-top: 15px;
+    }
+    .stat-item {
+        text-align: center;
+        padding: 10px;
+        background: white;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    .stat-label {
+        font-weight: 600;
+        color: #7f8c8d;
+        font-size: 0.9em;
+    }
+    .stat-value {
+        font-size: 1.2em;
+        font-weight: bold;
+        color: #2c3e50;
+    }
+    .alert-custom {
+        border-radius: 8px;
+        margin-bottom: 15px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header bg-primary text-white">
+        <h5 class="mb-0">⚙️ Параметры сканирования</h5>
+    </div>
+    <div class="card-body">
+        <form id="scanForm">
+            <div class="mb-3">
+                <label for="rootDir" class="form-label">Директория для сканирования</label>
+                <input type="text" class="form-control" id="rootDir" name="root_dir" 
+                       value="{{ default_root_dir }}" required>
+                <div class="form-text">Папка, в которой будут искаться документы</div>
+            </div>
+            <div class="mb-3">
+                <label for="indexDir" class="form-label">Директория для сохранения кэша</label>
+                <input type="text" class="form-control" id="indexDir" name="index_dir" 
+                       value="{{ index_dir }}" required>
+                <div class="form-text">Папка, куда будет сохранен файл {{ scan_cache_file }}</div>
+            </div>
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label for="minFileSize" class="form-label">Минимальный размер файла (КБ)</label>
+                    <input type="number" class="form-control" id="minFileSize" name="min_file_size" 
+                           value="{{ min_file_size_kb }}" min="1" step="1">
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="maxTextLen" class="form-label">Максимальная длина текста (символов)</label>
+                    <input type="number" class="form-control" id="maxTextLen" name="max_text_len" 
+                           value="{{ max_text_len }}" min="1000" step="10000">
+                </div>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Поддерживаемые расширения</label>
+                <div class="config-section">
+                    {% for ext in supported_exts %}
+                        <span class="badge bg-secondary me-1">{{ ext }}</span>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="mb-3 form-check">
+                <input type="checkbox" class="form-check-input" id="useCache" name="use_cache" 
+                       {% if use_cache %}checked{% endif %}>
+                <label class="form-check-label" for="useCache">Использовать кэш для инкрементального обновления</label>
+                <div class="form-text">
+                    При включении будут обрабатываться только новые файлы и измененные файлы, а также удаляться записи для файлов, которых больше нет
+                </div>
+            </div>
+            <button type="submit" class="btn btn-start btn-lg w-100 mb-2">
+                <i class="bi bi-play-fill me-2"></i>Начать сканирование
+            </button>
+            <button type="button" class="btn btn-stop btn-lg w-100" id="stopScanButton" style="display:none;">
+                <i class="bi bi-stop-fill me-2"></i>Остановить сканирование
+            </button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header bg-info text-white">
+        <h5 class="mb-0">📊 Статус сканирования</h5>
+    </div>
+    <div class="card-body">
+        <div class="mb-3">
+            <div class="d-flex justify-content-between">
+                <span>Текущий статус:</span>
+                <span id="statusBadge" class="status-badge bg-secondary">Ожидание</span>
+            </div>
+        </div>
+        <div class="progress" style="display: none;" id="progressContainer">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                 role="progressbar" id="progressBar" style="width: 0%">0%</div>
+        </div>
+        <div class="mt-3" id="currentFileContainer" style="display: none;">
+            <small>Текущий файл:</small>
+            <p class="mb-0 text-truncate" id="currentFile" style="max-width: 100%;"></p>
+        </div>
+        <div class="mt-4" id="statsContainer" style="display: none;">
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <div class="stat-label">Обработано</div>
+                    <div class="stat-value" id="processedCount">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Мелкие файлы</div>
+                    <div class="stat-value" id="skippedSmallCount">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Пустые файлы</div>
+                    <div class="stat-value" id="skippedEmptyCount">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Дубликаты</div>
+                    <div class="stat-value" id="skippedDupesCount">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Осталось</div>
+                    <div class="stat-value" id="remainingTime">-</div>
+                </div>
+            </div>
+        </div>
+        <div class="mt-4" id="resultContainer" style="display: none;">
+            <div class="alert alert-success alert-custom">
+                <h5 class="alert-heading">✅ Сканирование завершено!</h5>
+                <p>Кэш успешно сохранен в: <strong id="resultPath"></strong></p>
+                <p>Всего обработано файлов: <strong id="totalProcessed">0</strong></p>
+                <p>Время выполнения: <strong id="executionTime">0</strong> секунд</p>
+                <div class="mt-3">
+                    <a href="/download_scan_cache" class="btn btn-primary me-2">
+                        <i class="bi bi-download me-1"></i>Скачать кэш
+                    </a>
+                    <a href="http://{{ embedding_host }}:{{ embedding_port }}" target="_blank" class="btn btn-success">
+                        <i class="bi bi-arrow-right me-1"></i>Создать эмбеддинги
+                    </a>
+                </div>
+            </div>
+        </div>
+        <div class="mt-4" id="errorContainer" style="display: none;">
+            <div class="alert alert-danger alert-custom">
+                <h5 class="alert-heading">❌ Ошибка при сканировании</h5>
+                <p id="errorMessage"></p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mt-4">
+    <div class="card-header bg-warning text-white">
+        <h5 class="mb-0">💡 Инструкция по использованию</h5>
+    </div>
+    <div class="card-body">
+        <div class="mb-3">
+            <strong>1. Настройте параметры сканирования:</strong>
+            <ul>
+                <li>Укажите директорию с документами для индексации</li>
+                <li>Выберите директорию для сохранения кэша</li>
+                <li>Настройте минимальный размер файла и максимальную длину текста</li>
+                <li>Включите опцию использования кэша для инкрементального обновления</li>
+            </ul>
+        </div>
+        <div class="mb-3">
+            <strong>2. Запустите сканирование:</strong>
+            <p>Нажмите кнопку "Начать сканирование" и дождитесь завершения процесса</p>
+        </div>
+        <div class="mb-3">
+            <strong>3. Следующие шаги:</strong>
+            <ul>
+                <li>После завершения сканирования скачайте файл кэша</li>
+                <li>Перейдите к созданию эмбеддингов для обработки текстов</li>
+                <li>Затем запустите семантический поиск</li>
+            </ul>
+        </div>
+        <div class="alert alert-info">
+            <strong>Совет:</strong> Для больших коллекций документов используйте инкрементальное обновление (включите опцию "Использовать кэш"), чтобы не обрабатывать заново все файлы при каждом запуске.
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    let scanInterval;
+    let isScanning = false;
+    
+    $(document).ready(function() {
+        $('#scanForm').on('submit', function(e) {
+            e.preventDefault();
+            startScan();
+        });
+        
+        $('#stopScanButton').on('click', function() {
+            stopScan();
+        });
+    });
+    
+    function startScan() {
+        // Сброс состояния
+        $('#progressContainer').hide();
+        $('#currentFileContainer').hide();
+        $('#statsContainer').hide();
+        $('#resultContainer').hide();
+        $('#errorContainer').hide();
+        $('#stopScanButton').show();
+        
+        // Отправка формы
+        $.ajax({
+            url: '/start_scan',
+            method: 'POST',
+            data: $('#scanForm').serialize(),
+            success: function(response) {
+                if (response.success) {
+                    isScanning = true;
+                    $('#statusBadge').removeClass().addClass('status-badge bg-warning').text('Сканирование');
+                    $('#progressContainer').show();
+                    $('#currentFileContainer').show();
+                    $('#statsContainer').show();
+                    $('#stopScanButton').prop('disabled', false);
+                    
+                    // Запуск опроса статуса
+                    clearInterval(scanInterval);
+                    scanInterval = setInterval(updateScanStatus, 1000);
+                } else {
+                    showError(response.message);
+                }
+            },
+            error: function() {
+                showError('Ошибка при запуске сканирования');
+            }
+        });
+    }
+    
+    function stopScan() {
+        $('#stopScanButton').prop('disabled', true);
+        $.post('/stop_scan', function(response) {
+            if (!response.success) {
+                alert('Ошибка при остановке сканирования: ' + response.message);
+                $('#stopScanButton').prop('disabled', false);
+            }
+        });
+    }
+    
+    function updateScanStatus() {
+        if (!isScanning) return;
+        
+        $.get('/scan_status', function(data) {
+            if (!data) return;
+            
+            $('#progressBar').css('width', data.progress + '%').text(data.progress + '%');
+            $('#currentFile').text(data.current_file || 'Подготовка...');
+            $('#processedCount').text(data.processed);
+            $('#skippedSmallCount').text(data.skipped_small);
+            $('#skippedEmptyCount').text(data.skipped_empty);
+            $('#skippedDupesCount').text(data.skipped_dupes);
+            $('#remainingTime').text(data.remaining_time || '-');
+            
+            if (data.status === 'completed') {
+                finishScanning(data);
+            } else if (data.status === 'error') {
+                showError(data.error_message);
+            } else if (data.status === 'stopping') {
+                $('#statusBadge').removeClass().addClass('status-badge bg-info').text('Остановка');
+            } else if (data.status === 'idle') {
+                clearInterval(scanInterval);
+                isScanning = false;
+                $('#stopScanButton').hide();
+            }
+        });
+    }
+    
+    function finishScanning(data) {
+        clearInterval(scanInterval);
+        isScanning = false;
+        $('#stopScanButton').hide();
+        
+        $('#statusBadge').removeClass().addClass('status-badge bg-success').text('Завершено');
+        $('#progressBar').removeClass('progress-bar-striped progress-bar-animated bg-warning')
+                         .addClass('bg-success');
+        $('#resultPath').text(data.result_path);
+        $('#totalProcessed').text(data.processed);
+        $('#executionTime').text((data.end_time - data.start_time).toFixed(1));
+        $('#resultContainer').show();
+    }
+    
+    function showError(message) {
+        clearInterval(scanInterval);
+        isScanning = false;
+        $('#stopScanButton').hide();
+        
+        $('#statusBadge').removeClass().addClass('status-badge bg-danger').text('Ошибка');
+        $('#errorMessage').text(message);
+        $('#errorContainer').show();
+    }
+</script>
+{% endblock %}
+
+{% block footer_text %}
+Система создания кэша сканирования • {{ current_year }} • Порт: {{ port }}
+{% endblock %}

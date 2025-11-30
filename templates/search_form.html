@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Семантический поиск{% endblock %}
+
+{% block header_title %}🔍 Семантический поиск по документам{% endblock %}
+{% block header_subtitle %}Система интеллектуального поиска на основе нейронных сетей{% endblock %}
+
+{% block content %}
+<div class="card mb-4">
+    <div class="card-body">
+        <form method="POST" action="/">
+            <div class="mb-3">
+                <input type="text" name="query" class="form-control form-control-lg" 
+                       placeholder="Введите поисковый запрос..." required>
+            </div>
+            <div class="row mb-4">
+                <div class="col-md-6">
+                    <label class="form-label">Количество результатов:</label>
+                    <input type="number" name="top_k" value="5" min="1" max="1000" 
+                           class="form-control" style="max-width: 150px;">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary btn-lg w-100">
+                <i class="bi bi-search me-2"></i>НАЙТИ ДОКУМЕНТЫ
+            </button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header bg-info text-white">
+        <h5 class="mb-0">ℹ️ Информация о системе</h5>
+    </div>
+    <div class="card-body">
+        <div class="row">
+            <div class="col-md-6 mb-3">
+                <strong>Индекс:</strong><br>
+                {{ index_dir }}
+            </div>
+            <div class="col-md-6 mb-3">
+                <strong>Модель:</strong><br>
+                {{ model_name }}
+            </div>
+            <div class="col-md-6 mb-3">
+                <strong>Документов в индексе:</strong><br>
+                {{ doc_count }}
+            </div>
+            <div class="col-md-6 mb-3">
+                <strong>Порт сервера:</strong><br>
+                {{ port }}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block footer_text %}
+Система семантического поиска • {{ current_year }} • Порт: {{ port }}
+{% endblock %}
