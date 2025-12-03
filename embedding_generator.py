@@ -1,365 +1,319 @@
+# embedding_generator.py (Полностью обновленная версия с чекпоинтингом)
 import os
 import sys
 import time
 import pickle
-import numpy as np
-import torch
-import tempfile
-import webbrowser
-from pathlib import Path
-from werkzeug.utils import secure_filename
-from flask import Flask, request, render_template, jsonify, send_file
+import json
 import threading
-from tqdm import tqdm
+from pathlib import Path
+from flask import Flask, render_template, request, jsonify, redirect, url_for
+import webbrowser
+import numpy as np
+import faiss
+import tempfile
+import shutil
+import gzip
+import datetime
+from typing import List, Tuple
 
-# Импорт из общей конфигурации
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import EMBEDDING_HOST, EMBEDDING_PORT, EMBEDDING_MODEL, MAX_FILE_SIZE, SUPPORTED_EXTS, CACHE_DIR, TEMP_DIR, USE_FP16, SCANNER_HOST, SCANNER_PORT
-from document_processor import detect_format, extract_text, sanitize_filename
-from embeddings import load_embedding_model, generate_embeddings_with_embedding_model, save_embeddings
+script_dir = Path(__file__).parent
+sys.path.insert(0, str(script_dir))
+import config
+from embeddings import load_embedding_model, generate_embeddings_with_embedding_model, create_faiss_index, save_index
+from document_processor import extract_text, clean_text
+from utils import ProcessTracker, ensure_directories, should_pause_for_daily_limit, save_checkpoint, load_checkpoint, chunk_list, format_time, save_timing_data
 
-# Глобальные переменные для отслеживания прогресса обработки кэша
-cache_processing_status = {
-    'status': 'idle',  # idle, processing, completed, error
-    'progress': 0,
-    'current_file': '',
-    'total_files': 0,
-    'processed': 0,
-    'result_path': '',
-    'error_message': '',
-    'start_time': 0,
-    'end_time': 0
-}
+app = Flask(__name__)
+tracker = ProcessTracker()
 
-# Инициализация Flask приложения
-app = Flask(__name__, template_folder='./templates')
-app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
-app.config['UPLOAD_FOLDER'] = str(TEMP_DIR)
+# Глобальные переменные для управления процессом
+embedding_thread = None
+stop_embedding = threading.Event()
 
-# Загрузка модели BAAI/bge-m3
-print("🧠 Загрузка модели BAAI/bge-m3 для создания эмбеддингов...")
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"⚙️ Используемое устройство: {device}")
-embedding_model = load_embedding_model(device)
+def save_uploaded_file(file_obj):
+    """Сохраняет загруженный файл во временный каталог и возвращает путь к нему."""
+    if not hasattr(save_uploaded_file, 'temp_dir'):
+        save_uploaded_file.temp_dir = script_dir / "temp_uploads"
+        save_uploaded_file.temp_dir.mkdir(exist_ok=True)
+    temp_path = save_uploaded_file.temp_dir / file_obj.filename
+    file_obj.save(temp_path)
+    return temp_path
 
-def process_cache_embeddings_worker(cache_path, output_path):
-    """Фоновый процесс генерации эмбеддингов для всех документов из кэша"""
-    global cache_processing_status
+def generate_embeddings_batch(model, batch_texts: List[str]) -> np.ndarray:
+    """Генерация эмбеддингов для пакета текстов"""
     try:
-        # Загрузка кэша сканирования
+        # Для BGE-small добавляем префикс задачи
+        sentences = [f"Represent this sentence for searching relevant passages: {text}" for text in batch_texts]
+        batch_embeddings = model.encode(
+            sentences,
+            batch_size=len(batch_texts),
+            show_progress_bar=False,
+            convert_to_tensor=False,
+            normalize_embeddings=True
+        )
+        return np.array(batch_embeddings, dtype=np.float32)
+    except Exception as e:
+        raise e
+
+def process_embeddings_from_cache(cache_file_path):
+    """Генерация эмбеддингов из кэша сканирования с чекпоинтингом"""
+    global stop_embedding
+    
+    start_time = time.time()
+    stop_embedding.clear()
+    
+    # Проверяем наличие файла кэша
+    cache_path = Path(cache_file_path)
+    if not cache_path.exists():
+        tracker.finish_task(f"Файл кэша не найден: {cache_file_path}")
+        return
+        
+    # Определяем пути для чекпоинтов и результатов
+    cache_stem = cache_path.stem
+    checkpoint_file = config.CACHE_DIR / f"embedding_checkpoint_{cache_stem}.json"
+    partial_index_dir = config.PARTIAL_INDEX_DIR / cache_stem
+    partial_index_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Загружаем кэш
+    try:
         with open(cache_path, 'rb') as f:
             cache_data = pickle.load(f)
-        
-        if not cache_data:
-            cache_processing_status.update({
-                'status': 'error',
-                'error_message': 'Не удалось загрузить кэш сканирования',
-                'end_time': time.time()
-            })
-            return False
-        
-        texts = cache_data['texts']
-        doc_paths = cache_data['doc_paths']
-        
-        cache_processing_status.update({
-            'status': 'processing',
-            'total_files': len(texts),
-            'start_time': time.time(),
-            'error_message': ''
-        })
-        
-        print(f"🧠 Генерация эмбеддингов для {len(texts)} документов...")
-        
-        # Пакетная обработка для отображения прогресса
-        batch_size = 8  # Уменьшаем размер батча для обработки длинных документов
-        all_embeddings = []
-        
-        for i in range(0, len(texts), batch_size):
-            if cache_processing_status['status'] != 'processing':
-                print("❌ Обработка прервана")
-                return False
-            
-            batch_texts = texts[i:i+batch_size]
-            batch_paths = doc_paths[i:i+batch_size]
-            
-            # Обновление прогресса
-            if batch_paths:
-                cache_processing_status['current_file'] = Path(batch_paths[0]).name
-            cache_processing_status['processed'] = i
-            cache_processing_status['progress'] = int((i / max(1, len(texts))) * 100)
-            
-            # Генерация эмбеддингов для пакета
-            batch_embeddings = generate_embeddings_with_embedding_model(embedding_model, batch_texts)
-            all_embeddings.extend(batch_embeddings.tolist())
-        
-        # Сохранение результатов
-        result_path = save_embeddings(output_path, doc_paths, np.array(all_embeddings))
-        
-        # Обновление статуса по завершению
-        cache_processing_status.update({
-            'status': 'completed',
-            'end_time': time.time(),
-            'result_path': str(result_path),
-            'processed': len(texts),
-            'progress': 100,
-            'current_file': 'Готово'
-        })
-        
-        print(f"✅ Эмбеддинги успешно сохранены в {result_path}")
-        return True
     except Exception as e:
-        cache_processing_status.update({
-            'status': 'error',
-            'error_message': str(e),
-            'end_time': time.time()
-        })
-        print(f"❌ Ошибка при обработке кэша: {str(e)}")
-        raise
+        tracker.finish_task(f"Ошибка загрузки кэша: {str(e)}")
+        return
+        
+    # Проверяем формат кэша
+    if 'texts' not in cache_data or 'doc_paths' not in cache_data:
+        tracker.finish_task("Некорректный формат кэша сканирования")
+        return
+        
+    all_texts = cache_data['texts']
+    all_doc_paths = cache_data['doc_paths']
+    total_texts = len(all_texts)
+    
+    if total_texts == 0:
+        tracker.finish_task("Нет текстов для обработки")
+        return
+        
+    # Загружаем существующий чекпоинт если есть
+    checkpoint_data = load_checkpoint(checkpoint_file) if checkpoint_file.exists() else None
+    
+    if checkpoint_data:
+        processed_indices = set(checkpoint_data.get('processed_indices', []))
+        all_embeddings = checkpoint_data.get('embeddings', [])
+        all_paths = checkpoint_data.get('paths', [])
+        batch_num = checkpoint_data.get('batch_num', 0)
+        start_index = batch_num * config.BATCH_SIZE_EMBEDDING
+        
+        print(f"Возобновление генерации эмбеддингов с чекпоинта. Уже обработано: {len(processed_indices)} текстов")
+    else:
+        processed_indices = set()
+        all_embeddings = []
+        all_paths = []
+        batch_num = 0
+        start_index = 0
+        
+    tracker.start_task("Генерация эмбеддингов", total_texts)
+    
+    # Определяем устройство
+    import torch
+    device = 'cuda' if config.USE_FP16 and torch.cuda.is_available() else 'cpu'
+    tracker.update_progress(0, f"Загрузка модели на устройство: {device}")
+    
+    # Загружаем модель
+    try:
+        model = load_embedding_model(device)
+        tracker.update_progress(0, f"Модель загружена. Начинается генерация...")
+    except Exception as e:
+        tracker.finish_task(f"Ошибка загрузки модели: {str(e)}")
+        return
+        
+    # Обработка по пакетам
+    try:
+        for i in range(start_index, total_texts, config.BATCH_SIZE_EMBEDDING):
+            if stop_embedding.is_set() or should_pause_for_daily_limit():
+                # Сохраняем чекпоинт
+                checkpoint_data = {
+                    'processed_indices': list(processed_indices),
+                    'embeddings': all_embeddings,
+                    'paths': all_paths,
+                    'batch_num': i // config.BATCH_SIZE_EMBEDDING,
+                    'total_texts': total_texts,
+                    'source_cache': str(cache_path),
+                    'timestamp': datetime.datetime.now().isoformat()
+                }
+                save_checkpoint(checkpoint_file, checkpoint_data)
+                
+                pause_msg = "достигнут суточный лимит времени работы" if should_pause_for_daily_limit() else "остановлено пользователем"
+                tracker.stop_task(f"Генерация эмбеддингов приостановлена ({pause_msg}). Прогресс сохранен.")
+                return
+                
+            # Обрабатываем текущий пакет
+            batch_indices = list(range(i, min(i + config.BATCH_SIZE_EMBEDDING, total_texts)))
+            batch_texts = [all_texts[idx] for idx in batch_indices if idx not in processed_indices]
+            batch_paths = [all_doc_paths[idx] for idx in batch_indices if idx not in processed_indices]
+            
+            if not batch_texts:
+                continue
+                
+            batch_start_time = time.time()
+            
+            try:
+                # Генерируем эмбеддинги для пакета
+                batch_embeddings = generate_embeddings_batch(model, batch_texts)
+                
+                # Добавляем в общие списки
+                all_embeddings.extend(batch_embeddings.tolist())
+                all_paths.extend(batch_paths)
+                processed_indices.update(batch_indices)
+                
+                # Обновляем прогресс
+                elapsed_time = time.time() - start_time
+                batch_elapsed = time.time() - batch_start_time
+                texts_per_second = len(batch_texts) / batch_elapsed if batch_elapsed > 0 else 0
+                
+                progress_msg = (
+                    f"Обработано: {len(processed_indices)}/{total_texts} текстов "
+                    f"({len(processed_indices)/total_texts*100:.1f}%) | "
+                    f"Пакет {batch_num+1} завершен | "
+                    f"Скорость: {texts_per_second:.1f} текстов/сек"
+                )
+                
+                tracker.update_progress(len(processed_indices), progress_msg)
+                
+                # Сохраняем чекпоинт через каждые N файлов
+                if len(processed_indices) % config.CHECKPOINT_INTERVAL == 0:
+                    checkpoint_data = {
+                        'processed_indices': list(processed_indices),
+                        'embeddings': all_embeddings,
+                        'paths': all_paths,
+                        'batch_num': i // config.BATCH_SIZE_EMBEDDING + 1,
+                        'total_texts': total_texts,
+                        'source_cache': str(cache_path),
+                        'timestamp': datetime.datetime.now().isoformat()
+                    }
+                    save_checkpoint(checkpoint_file, checkpoint_data)
+                    print(f"Чекпоинт сохранен после обработки {len(processed_indices)} текстов")
+                    
+                batch_num += 1
+                
+            except Exception as e:
+                error_msg = f"Ошибка генерации эмбеддингов для пакета {batch_num+1}: {str(e)}"
+                print(error_msg)
+                tracker.update_progress(len(processed_indices), error_msg)
+                
+        # Создаем и сохраняем FAISS индекс
+        if not all_embeddings:
+            tracker.finish_task("Не удалось сгенерировать ни одного эмбеддинга")
+            return
+            
+        tracker.update_progress(total_texts, "Создание FAISS индекса...")
+        
+        # Преобразуем в numpy массив
+        embeddings_array = np.array(all_embeddings, dtype=np.float32)
+        
+        # Создаем индекс
+        index = create_faiss_index(embeddings_array)
+        
+        # Сохраняем индекс и пути
+        index_path = config.INDEX_DIR / config.INDEX_FILE
+        paths_path = config.INDEX_DIR / config.PATHS_FILE
+        
+        save_index(index, index_path)
+        
+        with open(paths_path, 'wb') as f:
+            pickle.dump(all_paths, f)
+            
+        # Удаляем чекпоинт после успешного завершения
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
+            
+        # Удаляем частичные индексы
+        shutil.rmtree(partial_index_dir, ignore_errors=True)
+            
+        end_time = time.time()
+        save_timing_data("embedding_generation", start_time, end_time, len(all_paths))
+        
+        # Формируем сообщение о завершении
+        completion_msg = (
+            f"Генерация эмбеддингов успешно завершена за {format_time(end_time - start_time)}. "
+            f"Создан индекс для {len(all_paths)} документов из кэша: {cache_path.name}. "
+            f"Средняя скорость: {len(all_paths)/(end_time-start_time):.1f} документов/сек"
+        )
+        
+        tracker.finish_task(completion_msg)
+        print(completion_msg)
+        
+    except Exception as e:
+        error_msg = f"Критическая ошибка при генерации эмбеддингов: {str(e)}"
+        print(error_msg)
+        tracker.finish_task(error_msg)
 
 @app.route('/')
 def index():
-    """Главная страница с выбором режима работы"""
-    return render_template(
-        'embedding_generator.html',
-        supported_exts_single=SUPPORTED_EXTS,
-        current_year=time.localtime().tm_year,
-        port=EMBEDDING_PORT,
-        scanner_host=SCANNER_HOST,
-        scanner_port=SCANNER_PORT
-    )
+    return render_template('embedding_generator.html', now=datetime.datetime.now())
 
-@app.route('/generate_embeddings', methods=['POST'])
-def generate_embeddings_endpoint():
-    """Эндпоинт для генерации эмбеддингов для отдельных файлов"""
-    if 'files' not in request.files:
-        return jsonify({'error': 'Файлы не были загружены'}), 400
+@app.route('/process-cache', methods=['POST'])
+def process_cache():
+    global embedding_thread, stop_embedding
     
-    files = request.files.getlist('files')
-    results = []
-    
-    # Если нет файлов
-    if not files or all(f.filename == '' for f in files):
-        return jsonify({'error': 'Не выбраны файлы для обработки'}), 400
-    
-    for file in files:
-        filename = secure_filename(file.filename)
-        ext = Path(filename).suffix.lower()
-        
-        # Проверка расширения
-        if ext not in SUPPORTED_EXTS:
-            results.append({
-                'filename': filename,
-                'error': f'Неподдерживаемый формат файла. Поддерживаются: {", ".join(SUPPORTED_EXTS)}'
-            })
-            continue
-        
-        # Сохранение файла во временную директорию
-        file_path = TEMP_DIR / filename
-        file.save(str(file_path))
-        
-        try:
-            # Определение формата и извлечение текста
-            file_format = detect_format(file_path)
-            if not file_format:
-                results.append({
-                    'filename': filename,
-                    'error': 'Не удалось определить формат файла'
-                })
-                continue
-            
-            text = extract_text(file_path)
-            if not text:
-                results.append({
-                    'filename': filename,
-                    'error': 'Не удалось извлечь текст из файла'
-                })
-                continue
-            
-            # Генерация эмбеддинга
-            embeddings = generate_embeddings_with_embedding_model(embedding_model, [text])
-            results.append({
-                'filename': filename,
-                'format': file_format.upper(),
-                'embedding': embeddings[0].tolist() if isinstance(embeddings[0], np.ndarray) else embeddings[0],
-                'text_length': len(text),
-                'vector_dimension': len(embeddings[0]) if isinstance(embeddings[0], (list, np.ndarray)) else 0
-            })
-        except Exception as e:
-            results.append({
-                'filename': filename,
-                'error': f'Ошибка обработки: {str(e)}'
-            })
-        finally:
-            # Удаление временного файла
-            if file_path.exists():
-                file_path.unlink()
-    
-    return jsonify({'results': results})
-
-@app.route('/start_cache_processing', methods=['POST'])
-def start_cache_processing():
-    """Запуск обработки кэша в фоновом режиме"""
-    global cache_processing_status
-    if cache_processing_status['status'] == 'processing':
-        return jsonify({'success': False, 'message': 'Обработка кэша уже запущена'})
-    
+    # Проверяем, был ли загружен файл
     if 'cache_file' not in request.files:
-        return jsonify({'success': False, 'message': 'Файл кэша не был загружен'}), 400
-    
-    cache_file = request.files['cache_file']
-    if cache_file.filename == '':
-        return jsonify({'success': False, 'message': 'Не выбран файл кэша'}), 400
-    
-    # Создаем директорию кэша, если она не существует
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Сохранить загруженный файл кэша во временную директорию
-    cache_path = CACHE_DIR / secure_filename(cache_file.filename)
-    cache_file.save(str(cache_path))
-    
-    # Путь для сохранения результата
-    output_path = CACHE_DIR / 'embeddings_cache.pkl'
-    
-    # Сброс статуса
-    cache_processing_status.update({
-        'status': 'idle',
-        'progress': 0,
-        'current_file': '',
-        'total_files': 0,
-        'processed': 0,
-        'result_path': '',
-        'error_message': '',
-        'start_time': 0,
-        'end_time': 0
-    })
-    
-    # Запуск обработки в отдельном потоке
-    threading.Thread(
-        target=process_cache_embeddings_worker,
-        args=(cache_path, output_path),
-        daemon=True
-    ).start()
-    
-    return jsonify({'success': True})
-
-@app.route('/cache_status')
-def get_cache_status():
-    """Получение текущего статуса обработки кэша"""
-    global cache_processing_status
-    # Вычисление примерного оставшегося времени
-    remaining_time = "-"
-    if cache_processing_status['status'] == 'processing' and cache_processing_status['start_time'] > 0 and cache_processing_status['processed'] > 0:
-        elapsed = time.time() - cache_processing_status['start_time']
-        files_per_sec = cache_processing_status['processed'] / elapsed if elapsed > 0 else 0
-        remaining_files = cache_processing_status['total_files'] - cache_processing_status['processed']
-        if files_per_sec > 0:
-            remaining_seconds = remaining_files / files_per_sec
-            if remaining_seconds < 60:
-                remaining_time = f"{int(remaining_seconds)} сек"
-            else:
-                remaining_time = f"{int(remaining_seconds/60)} мин"
-    return jsonify({
-        'status': cache_processing_status['status'],
-        'progress': cache_processing_status['progress'],
-        'current_file': cache_processing_status['current_file'],
-        'total_files': cache_processing_status['total_files'],
-        'processed': cache_processing_status['processed'],
-        'remaining_time': remaining_time,
-        'result_path': cache_processing_status['result_path'],
-        'error_message': cache_processing_status['error_message'],
-        'start_time': cache_processing_status['start_time'],
-        'end_time': cache_processing_status['end_time']
-    })
-
-@app.route('/download_embeddings_cache')
-def download_embeddings_cache():
-    """Скачивание обработанного кэша эмбеддингов"""
-    global cache_processing_status
-    if cache_processing_status['status'] != 'completed' or not cache_processing_status['result_path']:
-        return jsonify({'error': 'Нет готового файла для скачивания'}), 404
-    
+        return jsonify({'error': 'Файл кэша не загружен'})
+    file = request.files['cache_file']
+    if file.filename == '':
+        return jsonify({'error': 'Файл не выбран'})
+        
     try:
-        return send_file(
-            cache_processing_status['result_path'],
-            as_attachment=True,
-            download_name='embeddings_cache.pkl',
-            mimetype='application/octet-stream'
-        )
+        # Сохраняем загруженный файл во временный каталог
+        temp_cache_path = save_uploaded_file(file)
+        print(f"Загруженный файл кэша сохранен во временный каталог: {temp_cache_path}")
+        
+        # Сбрасываем флаг остановки
+        stop_embedding.clear()
+        
+        # Запускаем генерацию в отдельном потоке
+        embedding_thread = threading.Thread(target=process_embeddings_from_cache, args=(temp_cache_path,))
+        embedding_thread.start()
+        
+        return jsonify({'status': 'started', 'message': f'Генерация эмбеддингов запущена из кэша: {file.filename}'})
     except Exception as e:
-        return jsonify({'error': f'Ошибка при скачивании файла: {str(e)}'}), 500
+        error_msg = f"Ошибка обработки загруженного файла: {str(e)}"
+        print(error_msg)
+        tracker.finish_task(error_msg)
+        return jsonify({'error': error_msg})
+
+@app.route('/stop-generation', methods=['POST'])
+def stop_generation():
+    global stop_embedding
+    stop_embedding.set()
+    return jsonify({'status': 'stopped', 'message': 'Генерация остановлена'})
 
 @app.route('/status')
 def status():
-    """Проверка статуса сервиса"""
-    global cache_processing_status
-    return jsonify({
-        "status": "online",
-        "model": EMBEDDING_MODEL,
-        "device": device,
-        "cache_processing": cache_processing_status['status'],
-        "timestamp": time.time()
-    })
+    return jsonify(tracker.get_status())
 
-def open_browser():
-    """Открывает браузер после запуска сервера"""
-    time.sleep(1)  # Ждем, пока сервер запустится
-    webbrowser.open(f'http://{EMBEDDING_HOST}:{EMBEDDING_PORT}')
-
-def show_help():
-    """Показывает справку по использованию скрипта"""
-    print(f"""
-📚 Генератор эмбеддингов с веб-интерфейсом (BAAI/bge-m3)
-Использование:
-  python app.py
-Конфигурация:
-  Модель = {EMBEDDING_MODEL}
-  Веб-сервер: http://{EMBEDDING_HOST}:{EMBEDDING_PORT}
-Поддерживаемые форматы файлов:
-  {', '.join(SUPPORTED_EXTS)}
-Максимальный размер файла: {MAX_FILE_SIZE / (1024*1024)} МБ
-Временная директория: {TEMP_DIR}
-Кэш-директория: {CACHE_DIR}
-Особенности модели BAAI/bge-m3:
-  • Размерность векторов: 1024
-  • Максимальная длина последовательности: 8192 токена
-  • Поддержка 100+ языков
-Управление:
-  • Сервер запустится автоматически и откроет браузер
-  • Для остановки сервера нажмите Ctrl+C в консоли
-    """)
+@app.route('/timing-history')
+def timing_history():
+    """Возвращает историю времени выполнения задач"""
+    timing_file = config.CACHE_DIR / "timing_history.json"
+    if timing_file.exists():
+        try:
+            with open(timing_file, 'r') as f:
+                timing_data = json.load(f)
+            return jsonify(timing_data[-10:])  # Последние 10 записей
+        except Exception as e:
+            return jsonify({'error': str(e)})
+    return jsonify([])
 
 if __name__ == '__main__':
-    # Проверка необходимых зависимостей для mobi и epub
-    try:
-        import ebooklib
-        from ebooklib import epub
-        print("✅ Поддержка формата EPUB доступна")
-    except ImportError:
-        print("⚠️ Библиотека ebooklib не установлена. Установите: pip install EbookLib")
+    script_dir = Path(__file__).parent
+    sys.path.insert(0, str(script_dir))
+    import torch
+    ensure_directories()
     
-    try:
-        import mobi
-        print("✅ Поддержка формата MOBI доступна")
-    except ImportError:
-        print("⚠️ Библиотека mobi не установлена. Установите: pip install mobi")
+    # Открываем браузер
+    webbrowser.open(f'http://{config.EMBEDDING_HOST}:{config.EMBEDDING_PORT}/')
     
-    # Показываем справку
-    show_help()
-    
-    # Создаем и запускаем поток для открытия браузера
-    browser_thread = threading.Thread(target=open_browser)
-    browser_thread.daemon = True
-    browser_thread.start()
-    
-    # Запуск Flask приложения
-    print(f"""
-🚀 Запуск веб-сервера генератора эмбеддингов на http://{EMBEDDING_HOST}:{EMBEDDING_PORT}""")
-    print("Для остановки сервера нажмите Ctrl+C в консоли")
-    try:
-        app.run(host=EMBEDDING_HOST, port=EMBEDDING_PORT, debug=False, use_reloader=False)
-    except KeyboardInterrupt:
-        print("""
-🛑 Сервер остановлен пользователем""")
-    except Exception as e:
-        print(f"❌ Ошибка при запуске сервера: {str(e)}")
-        sys.exit(1)
+    # Запускаем сервер
+    app.run(host=config.EMBEDDING_HOST, port=config.EMBEDDING_PORT, debug=False)

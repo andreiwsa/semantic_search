@@ -1,59 +1,302 @@
-{% extends "base.html" %}
-
-{% block title %}Семантический поиск{% endblock %}
-
-{% block header_title %}🔍 Семантический поиск по документам{% endblock %}
-{% block header_subtitle %}Система интеллектуального поиска на основе нейронных сетей{% endblock %}
-
-{% block content %}
-<div class="card mb-4">
-    <div class="card-body">
-        <form method="POST" action="/">
-            <div class="mb-3">
-                <input type="text" name="query" class="form-control form-control-lg" 
-                       placeholder="Введите поисковый запрос..." required>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Семантический поиск</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="{{ url_for('index') }}">Семантический поиск</a>
+            <div class="collapse navbar-collapse">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('index') }}">Новый поиск</a>
+                    </li>
+                </ul>
             </div>
-            <div class="row mb-4">
-                <div class="col-md-6">
-                    <label class="form-label">Количество результатов:</label>
-                    <input type="number" name="top_k" value="5" min="1" max="1000" 
-                           class="form-control" style="max-width: 150px;">
+        </div>
+    </nav>
+    
+    <div class="container mt-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Параметры поиска</h5>
+            </div>
+            <div class="card-body">
+                {% if error %}
+                    <div class="alert alert-danger">
+                        {{ error }}
+                    </div>
+                {% endif %}
+                
+                <form method="POST" action="{{ url_for('search') }}">
+                    <div class="mb-3">
+                        <label for="query" class="form-label">Поисковый запрос</label>
+                        <input type="text" class="form-control" id="query" name="query" required
+                               placeholder="Введите запрос для поиска по смыслу">
+                        <div class="form-text">
+                            Система найдет документы, наиболее релевантные вашему запросу, даже если точных совпадений нет
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="top_k" class="form-label">Количество результатов</label>
+                            <input type="number" class="form-control" id="top_k" name="top_k" value="10" min="1" max="100">
+                            <div class="form-text">Сколько документов показать в результатах</div>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="threshold" class="form-label">Порог сходства</label>
+                            <input type="number" class="form-control" id="threshold" name="threshold" value="0.3" step="0.1" min="0.0" max="1.0">
+                            <div class="form-text">Минимальный уровень сходства (0.0 = все документы, 1.0 = только полные совпадения)</div>
+                        </div>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">Найти документы</button>
+                    <button type="button" class="btn btn-secondary" onclick="reloadData()">Перезагрузить данные</button>
+                </form>
+            </div>
+        </div>
+        
+        <div class="card mt-4">
+            <div class="card-header">
+                <h5 class="mb-0">Состояние системы</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-6">
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item">
+                                <strong>Модель:</strong> 
+                                <span class="badge bg-secondary">{{ model_name }}</span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Устройство:</strong> 
+                                <span class="badge bg-{% if device == 'cuda' %}success{% else %}secondary{% endif %}">
+                                    {% if device == 'cuda' %}GPU (CUDA){% else %}CPU{% endif %}
+                                </span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Документов в индексе:</strong> 
+                                <span class="badge bg-primary">{{ total_docs }}</span>
+                            </li>
+                        </ul>
+                    </div>
+                    <div class="col-md-6">
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item">
+                                <strong>Время загрузки данных:</strong> 
+                                <span id="lastLoadTime" class="badge bg-info">-</span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Статус системы:</strong> 
+                                <span id="systemStatus" class="badge bg-success">Готова к работе</span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Среднее время поиска:</strong> 
+                                <span id="avgSearchTime" class="badge bg-warning">-</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div class="mt-3" id="timingChartContainer" style="height: 200px; display: none;">
+                    <!-- График будет добавлен здесь через JavaScript -->
                 </div>
             </div>
-            <button type="submit" class="btn btn-primary btn-lg w-100">
-                <i class="bi bi-search me-2"></i>НАЙТИ ДОКУМЕНТЫ
-            </button>
-        </form>
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header bg-info text-white">
-        <h5 class="mb-0">ℹ️ Информация о системе</h5>
-    </div>
-    <div class="card-body">
-        <div class="row">
-            <div class="col-md-6 mb-3">
-                <strong>Индекс:</strong><br>
-                {{ index_dir }}
+        </div>
+        
+        <div class="card mt-4" id="performanceStatsCard" style="display: none;">
+            <div class="card-header">
+                <h5 class="mb-0">Статистика производительности</h5>
             </div>
-            <div class="col-md-6 mb-3">
-                <strong>Модель:</strong><br>
-                {{ model_name }}
-            </div>
-            <div class="col-md-6 mb-3">
-                <strong>Документов в индексе:</strong><br>
-                {{ doc_count }}
-            </div>
-            <div class="col-md-6 mb-3">
-                <strong>Порт сервера:</strong><br>
-                {{ port }}
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm" id="performanceTable">
+                        <thead>
+                            <tr>
+                                <th>Дата/Время</th>
+                                <th>Запрос</th>
+                                <th>Результатов</th>
+                                <th>Время поиска</th>
+                                <th>Общее время</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Данные будут добавлены через JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
     </div>
-</div>
-{% endblock %}
+    
+    <footer class="footer mt-4 py-3 bg-light">
+        <div class="container text-center">
+            <span class="text-muted">Семантический поиск &copy; {{ now.year }}</span>
+        </div>
+    </footer>
 
-{% block footer_text %}
-Система семантического поиска • {{ current_year }} • Порт: {{ port }}
-{% endblock %}
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        let timingChart = null;
+        
+        $(document).ready(function() {
+            // Проверяем статус системы при загрузке
+            checkSystemStatus();
+            
+            // Загружаем статистику производительности
+            loadPerformanceStats();
+        });
+        
+        function checkSystemStatus() {
+            $.get('/status', function(data) {
+                if (data.status === 'ready') {
+                    $('#systemStatus').removeClass('bg-warning bg-danger').addClass('bg-success').text('Готова к работе');
+                    $('#lastLoadTime').text(data.last_load_time || 'Неизвестно');
+                } else {
+                    $('#systemStatus').removeClass('bg-success bg-warning').addClass('bg-danger').text('Ошибка: ' + data.message);
+                }
+            }).fail(function() {
+                $('#systemStatus').removeClass('bg-success bg-warning').addClass('bg-danger').text('Недоступна');
+            });
+        }
+        
+        function reloadData() {
+            if (confirm('Вы уверены, что хотите перезагрузить данные поиска? Это может занять несколько секунд.')) {
+                $.post('/reload-data', function(response) {
+                    if (response.status === 'success') {
+                        alert('Данные успешно перезагружены. Документов в индексе: ' + response.total_docs);
+                        $('#systemStatus').removeClass('bg-danger bg-warning').addClass('bg-success').text('Готова к работе');
+                        $('#lastLoadTime').text(new Date().toLocaleString());
+                    } else {
+                        alert('Ошибка при перезагрузке данных: ' + response.message);
+                        $('#systemStatus').removeClass('bg-success bg-warning').addClass('bg-danger').text('Ошибка');
+                    }
+                });
+            }
+        }
+        
+        function loadPerformanceStats() {
+            $.get('/timing-stats', function(data) {
+                if (data && data.length > 0) {
+                    $('#performanceStatsCard').show();
+                    const tableBody = $('#performanceTable tbody');
+                    tableBody.empty();
+                    
+                    // Фильтруем только данные поиска
+                    const searchStats = data.filter(item => item.task === 'semantic_search');
+                    
+                    searchStats.slice(-10).reverse().forEach(item => {
+                        const date = new Date(item.timestamp);
+                        const formattedDate = date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+                        const queryPreview = item.query.length > 30 ? item.query.substring(0, 30) + '...' : item.query;
+                        
+                        tableBody.append(`
+                            <tr>
+                                <td>${formattedDate}</td>
+                                <td title="${item.query}">${queryPreview}</td>
+                                <td>${item.items_processed}</td>
+                                <td>${formatDuration(item.search_time)}</td>
+                                <td>${formatDuration(item.duration)}</td>
+                            </tr>
+                        `);
+                    });
+                    
+                    // Обновляем среднее время поиска
+                    if (searchStats.length > 0) {
+                        const avgTime = searchStats.reduce((sum, item) => sum + item.duration, 0) / searchStats.length;
+                        $('#avgSearchTime').text(formatDuration(avgTime) + ' (на основе ' + searchStats.length + ' запросов)');
+                    }
+                    
+                    // Создаем график производительности
+                    createTimingChart(searchStats);
+                }
+            });
+        }
+        
+        function createTimingChart(stats) {
+            const ctx = document.createElement('canvas');
+            $('#timingChartContainer').html(ctx).show();
+            
+            const labels = stats.slice(-10).map(item => {
+                const date = new Date(item.timestamp);
+                return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            });
+            
+            const searchTimes = stats.slice(-10).map(item => item.search_time);
+            const totalTimes = stats.slice(-10).map(item => item.duration);
+            
+            timingChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'Время поиска (сек)',
+                            data: searchTimes,
+                            borderColor: 'rgb(75, 192, 192)',
+                            tension: 0.1,
+                            fill: false
+                        },
+                        {
+                            label: 'Общее время (сек)',
+                            data: totalTimes,
+                            borderColor: 'rgb(255, 99, 132)',
+                            tension: 0.1,
+                            fill: false
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Время (секунды)'
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Последние запросы'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
+        function formatDuration(seconds) {
+            if (seconds < 0) seconds = 0;
+            if (seconds < 1) {
+                return (seconds * 1000).toFixed(0) + ' мс';
+            }
+            
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = Math.floor(seconds % 60);
+            const millis = Math.floor((seconds % 1) * 1000);
+            
+            if (hours > 0) {
+                return `${hours}ч ${minutes}м ${secs}с`;
+            } else if (minutes > 0) {
+                return `${minutes}м ${secs}с`;
+            } else if (seconds >= 1) {
+                return `${secs}с ${millis}мс`;
+            } else {
+                return `${millis}мс`;
+            }
+        }
+    </script>
+</body>
+</html>

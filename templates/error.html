@@ -3,15 +3,34 @@
 {% block title %}Ошибка{% endblock %}
 
 {% block content %}
-<div class="card text-center">
-    <div class="card-header bg-danger text-white">
-        <h3>❌ Ошибка</h3>
-    </div>
-    <div class="card-body">
-        <p class="error">{{ error }}</p>
-        <a href="/" class="btn btn-primary mt-3">
-            <i class="bi bi-arrow-left me-2"></i>Вернуться на главную
-        </a>
+<div class="row">
+    <div class="col-md-8 mx-auto">
+        <div class="card">
+            <div class="card-header bg-danger text-white">
+                <h3><i class="fas fa-exclamation-triangle"></i> Ошибка</h3>
+            </div>
+            <div class="card-body">
+                <div class="alert alert-danger">
+                    <h5><i class="fas fa-bug"></i> Произошла ошибка:</h5>
+                    <p>{{ error_message }}</p>
+                </div>
+                
+                <div class="alert alert-warning">
+                    <h5><i class="fas fa-lightbulb"></i> Рекомендации по решению:</h5>
+                    <ul>
+                        {% for recommendation in recommendations %}
+                        <li>{{ recommendation }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                
+                <div class="text-center">
+                    <a href="/" class="btn btn-primary">
+                        <i class="fas fa-arrow-left"></i> Вернуться на главную
+                    </a>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 {% endblock %}

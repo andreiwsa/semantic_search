@@ -1,387 +1,350 @@
+# document_scanner.py (Полностью обновленная версия с чекпоинтингом и оптимизацией)
 import os
 import sys
 import time
-import hashlib
-import pickle
 import json
 import threading
-import webbrowser
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify
-from tqdm import tqdm
+from flask import Flask, render_template, request, jsonify, redirect, url_for
+import webbrowser
+import datetime
+import queue
+import pickle
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import chardet  # Для детектирования кодировки
 
-# Импорт из общей конфигурации
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import SCANNER_HOST, SCANNER_PORT, INDEX_DIR, DEFAULT_ROOT_DIR, MIN_FILE_SIZE, MAX_TEXT_LEN, USE_CACHE, SUPPORTED_EXTS, SCAN_CACHE_FILE
-from document_processor import detect_format, extract_text, get_file_hash, is_valid_file, clean_text
+script_dir = Path(__file__).parent
+sys.path.insert(0, str(script_dir))
+import config
+from document_processor import extract_text, get_file_hash, clean_text, detect_format
+from utils import ProcessTracker, ensure_directories, should_pause_for_daily_limit, save_checkpoint, load_checkpoint, chunk_list, format_time, save_timing_data
 
-# Глобальные переменные для отслеживания прогресса сканирования
-scan_status = {
-    'status': 'idle',  # idle, scanning, completed, error
-    'progress': 0,
-    'current_file': '',
-    'total_files': 0,
-    'processed': 0,
-    'skipped_small': 0,
-    'skipped_empty': 0,
-    'skipped_dupes': 0,
-    'result_path': '',
-    'error_message': '',
-    'start_time': 0,
-    'end_time': 0
-}
+app = Flask(__name__)
+tracker = ProcessTracker()
 
-# Инициализация Flask приложения
-app = Flask(__name__, template_folder='./templates')
+# Глобальные переменные для управления процессом
+scan_thread = None
+stop_scan = threading.Event()
 
-def load_scan_cache(index_dir):
-    """Загрузка кэша сканирования"""
-    scan_cache_path = Path(index_dir) / SCAN_CACHE_FILE
-    if not scan_cache_path.exists():
-        return None
-    try:
-        with open(scan_cache_path, 'rb') as f:
-            return pickle.load(f)
-    except Exception as e:
-        print(f"⚠️ Ошибка при загрузке кэша: {str(e)}")
-        return None
+def count_files_in_directory(root_dir, supported_exts):
+    """Подсчитывает количество файлов, подходящих по расширению."""
+    count = 0
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            if Path(file).suffix.lower() in supported_exts:
+                count += 1
+        # Проверяем флаг остановки
+        if stop_scan.is_set():
+            return count
+    return count
 
-def scan_documents(root_dir, index_dir, min_file_size, max_text_len, use_cache):
-    """Основная функция сканирования документов"""
-    global scan_status
-    try:
-        root = Path(root_dir)
-        index_path = Path(index_dir)
-        if not root.is_dir():
-            raise Exception(f"Папка не найдена: {root_dir}")
-        index_path.mkdir(parents=True, exist_ok=True)
-        scan_cache_path = index_path / SCAN_CACHE_FILE
+def get_all_file_paths(root_dir):
+    """Получает все пути к файлам для обработки"""
+    all_file_paths = []
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            if Path(file).suffix.lower() in config.SUPPORTED_EXTS:
+                all_file_paths.append(str(Path(root) / file))
+    return all_file_paths
+
+def process_file_batch(file_batch, existing_cache, stats, min_file_size, max_text_len):
+    """Обрабатывает пакет файлов"""
+    results = []
+    for file_path_str in file_batch:
+        if stop_scan.is_set() or should_pause_for_daily_limit():
+            return results, True  # Второй параметр - флаг прерывания
         
-        # Поддерживаемые расширения
-        supported_exts = SUPPORTED_EXTS
-        
-        # Обновление статуса
-        scan_status.update({
-            'status': 'scanning',
-            'start_time': time.time(),
-            'error_message': ''
-        })
-        
-        # Загрузка существующего кэша если есть
-        scan_cache = load_scan_cache(index_dir) if use_cache else None
-        
-        # Сбор всех файлов с подходящими расширениями
-        all_files = []
-        for ext in supported_exts:
-            all_files.extend(root.rglob(f'*{ext}'))
-        scan_status['total_files'] = len(all_files)
-        
-        # Определение файлов для обработки при инкрементальном обновлении
-        files_to_process = all_files
-        removed_files = []
-        doc_paths = []
-        texts = []
-        seen_hashes = set()
-        
-        if scan_cache and use_cache:
-            # Загружаем данные из кэша
-            doc_paths = scan_cache['doc_paths'][:]
-            texts = scan_cache['texts'][:]
-            seen_hashes = set(scan_cache['seen_hashes'])
+        file_path = Path(file_path_str)
+        try:
+            # Проверяем размер файла
+            if not file_path.exists():
+                stats['skipped_error'] += 1
+                print(f"Файл не существует: {file_path_str}")
+                continue
+                
+            file_size = file_path.stat().st_size
+            if file_size < min_file_size:
+                stats['skipped_small'] += 1
+                continue
+                
+            # Извлекаем текст
+            try:
+                text = extract_text(file_path)
+            except Exception as e:
+                stats['skipped_error'] += 1
+                print(f"Критическая ошибка извлечения текста из {file_path_str}: {str(e)}")
+                continue
+                
+            if not text or not isinstance(text, str) or not text.strip():
+                stats['skipped_empty'] += 1
+                continue
+                
+            # Ограничиваем длину текста
+            if len(text) > max_text_len:
+                text = text[:max_text_len]
+                
+            # Очищаем текст
+            text = clean_text(text)
+            if not text.strip():
+                stats['skipped_empty'] += 1
+                continue
+                
+            # Проверяем на дубликат
+            text_hash = get_file_hash(text)
+            if text_hash in existing_cache.get('hashes', {}):
+                stats['skipped_duplicate'] += 1
+                continue
+                
+            # Обновляем статистику по типам файлов
+            ext = file_path.suffix.lower()
+            stats['file_types'][ext] = stats['file_types'].get(ext, 0) + 1
             
-            # Определяем файлы для обновления
-            cached_paths = set(scan_cache['doc_paths'])
-            cached_mtimes = {}
-            for path in scan_cache['doc_paths']:
-                p = Path(path)
-                if p.exists():
-                    cached_mtimes[path] = p.stat().st_mtime
+            results.append({
+                'path': file_path_str,
+                'text': text,
+                'hash': text_hash
+            })
+            stats['processed'] += 1
+        except Exception as e:
+            stats['skipped_error'] += 1
+            print(f"Ошибка обработки файла {file_path_str}: {str(e)}")
             
-            files_to_add = []
-            files_to_recheck = []
-            for file_path in all_files:
-                str_path = str(file_path)
-                if str_path not in cached_paths:
-                    files_to_add.append(file_path)
-                elif str_path in cached_mtimes:
-                    current_mtime = file_path.stat().st_mtime
-                    if current_mtime > cached_mtimes[str_path] + 1:
-                        files_to_recheck.append(file_path)
-            
-            # Проверка удаленных файлов
-            removed_files = [path for path in cached_paths if not Path(path).exists()]
-            for removed_path in removed_files:
-                if removed_path in doc_paths:
-                    idx = doc_paths.index(removed_path)
-                    doc_paths.pop(idx)
-                    texts.pop(idx)
-            
-            files_to_process = files_to_add + files_to_recheck
+    return results, False
+
+def scan_documents(root_dir, min_file_size, max_text_len, use_cache, add_timestamp):
+    """Функция для сканирования документов с чекпоинтингом"""
+    global stop_scan
+    start_time = time.time()
+    stop_scan.clear()
+    
+    # Проверяем директорию
+    root_path = Path(root_dir)
+    if not root_path.exists() or not root_path.is_dir():
+        tracker.finish_task(f"Директория не найдена или не является папкой: {root_dir}")
+        return
         
-        # Обработка файлов
-        processed_count = 0
-        skipped_small = 0
-        skipped_empty = 0
-        skipped_dupes = 0
-        scan_status.update({
+    # Определяем имя файла кэша и чекпоинта
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") if add_timestamp else ""
+    cache_filename = f"scan_cache_{timestamp}.pkl" if timestamp else config.SCAN_CACHE_FILE
+    cache_path = config.INDEX_DIR / cache_filename
+    checkpoint_file = config.CACHE_DIR / f"scan_checkpoint_{timestamp if timestamp else 'latest'}.json"
+    
+    # Загружаем чекпоинт если существует
+    checkpoint_data = load_checkpoint(checkpoint_file) if checkpoint_file.exists() and use_cache else None
+    if checkpoint_data:
+        doc_paths = checkpoint_data.get('doc_paths', [])
+        doc_texts = checkpoint_data.get('doc_texts', [])
+        doc_hashes = checkpoint_data.get('doc_hashes', [])
+        stats = checkpoint_data.get('stats', {
             'processed': 0,
             'skipped_small': 0,
             'skipped_empty': 0,
-            'skipped_dupes': 0,
-            'current_file': ''
+            'skipped_duplicate': 0,
+            'skipped_error': 0,
+            'file_types': {}
         })
+        processed_count = checkpoint_data.get('processed_count', 0)
+        batch_num = checkpoint_data.get('batch_num', 0)
+        all_file_paths = checkpoint_data.get('all_file_paths', [])
+        print(f"Возобновление сканирования с чекпоинта. Уже обработано: {processed_count} файлов")
+    else:
+        # Подсчет файлов
+        print("Подсчет файлов...")
+        tracker.update_progress(0, "Подсчет файлов...")
+        all_file_paths = get_all_file_paths(root_dir)
+        total_files = len(all_file_paths)
+        if total_files == 0:
+            tracker.finish_task("Не найдено подходящих файлов для сканирования")
+            return
+            
+        tracker.start_task("Сканирование документов", total_files)
+        print(f"Найдено {total_files} файлов для обработки.")
         
-        for i, file_path in enumerate(files_to_process):
-            if scan_status['status'] != 'scanning':
-                break
-            scan_status['current_file'] = str(file_path.relative_to(root))
-            scan_status['progress'] = int((i + 1) / max(1, len(files_to_process)) * 100)
-            
-            if not file_path.is_file():
-                continue
-            
-            file_size = file_path.stat().st_size
-            # Пропуск маленьких файлов
-            if file_size < min_file_size:
-                skipped_small += 1
-                scan_status['skipped_small'] = skipped_small
-                continue
-            
-            # Извлечение текста
-            text = extract_text(file_path)
-            if not text:
-                skipped_empty += 1
-                scan_status['skipped_empty'] = skipped_empty
-                continue
-            
-            # Очистка текста
-            text = clean_text(text)
-            
-            # Проверка на дубликаты
-            digest = get_file_hash(text)
-            if digest in seen_hashes:
-                skipped_dupes += 1
-                scan_status['skipped_dupes'] = skipped_dupes
-                continue
-            
-            # Добавление нового документа
-            seen_hashes.add(digest)
-            doc_paths.append(str(file_path))
-            texts.append(text[:max_text_len])
-            processed_count += 1
-            scan_status['processed'] = processed_count
-        
-        # Сохранение кэша
+        # Загружаем кэш если используется
+        existing_cache = {}
+        if use_cache and cache_path.exists():
+            try:
+                with open(cache_path, 'rb') as f:
+                    existing_cache = pickle.load(f)
+            except Exception as e:
+                print(f"Ошибка загрузки кэша: {e}. Продолжение без кэша.")
+                existing_cache = {}
+                
+        doc_paths = []
+        doc_texts = []
+        doc_hashes = []
         stats = {
-            'processed': processed_count,
-            'skipped_small': skipped_small,
-            'skipped_empty': skipped_empty,
-            'skipped_dupes': skipped_dupes,
-            'total_docs': len(doc_paths),
-            'removed_files': len(removed_files)
+            'processed': 0,
+            'skipped_small': 0,
+            'skipped_empty': 0,
+            'skipped_duplicate': 0,
+            'skipped_error': 0,
+            'file_types': {}
         }
+        processed_count = 0
+        batch_num = 0
         
-        cache_data = {
-            'doc_paths': doc_paths,
-            'texts': texts,
-            'seen_hashes': list(seen_hashes),
-            'stats': stats,
-            'timestamp': time.time()
-        }
+    # Разбиваем файлы на пакеты
+    file_batches = list(chunk_list(all_file_paths, config.BATCH_SIZE_SCAN))
+    total_batches = len(file_batches)
+    total_files = len(all_file_paths)
+    
+    # Обработка файлов партиями
+    for batch_num in range(batch_num, total_batches):
+        if stop_scan.is_set() or should_pause_for_daily_limit():
+            # Сохраняем чекпоинт
+            checkpoint_data = {
+                'doc_paths': doc_paths,
+                'doc_texts': doc_texts,
+                'doc_hashes': doc_hashes,
+                'stats': stats,
+                'processed_count': processed_count,
+                'batch_num': batch_num,
+                'all_file_paths': all_file_paths,
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+            save_checkpoint(checkpoint_file, checkpoint_data)
+            pause_msg = "достигнут суточный лимит времени работы" if should_pause_for_daily_limit() else "остановлено пользователем"
+            tracker.stop_task(f"Сканирование приостановлено ({pause_msg}). Прогресс сохранен.")
+            return
+            
+        # Обрабатываем текущий пакет
+        batch_start_time = time.time()
+        batch_files = file_batches[batch_num]
+        existing_cache = {'hashes': dict(zip(doc_hashes, doc_paths))} if doc_hashes else {}
+        batch_results, interrupted = process_file_batch(
+            batch_files, 
+            existing_cache, 
+            stats, 
+            min_file_size, 
+            max_text_len
+        )
         
-        with open(scan_cache_path, 'wb') as f:
-            pickle.dump(cache_data, f)
+        # Добавляем результаты пакета
+        for result in batch_results:
+            doc_paths.append(result['path'])
+            doc_texts.append(result['text'])
+            doc_hashes.append(result['hash'])
+            
+        processed_count += len(batch_results)
         
-        # Обновление статуса по завершению
-        scan_status.update({
-            'status': 'completed',
-            'end_time': time.time(),
-            'result_path': str(scan_cache_path),
-            'processed': processed_count,
-            'skipped_small': skipped_small,
-            'skipped_empty': skipped_empty,
-            'skipped_dupes': skipped_dupes,
-            'progress': 100
-        })
+        # Обновляем прогресс
+        elapsed_time = time.time() - start_time
+        batch_elapsed = time.time() - batch_start_time
+        files_per_second = len(batch_results) / batch_elapsed if batch_elapsed > 0 else 0
+        progress_msg = (
+            f"Обработано: {processed_count}/{total_files} файлов "
+            f"({processed_count/total_files*100:.1f}%) | "
+            f"Пакет {batch_num+1}/{total_batches} завершен | "
+            f"Скорость: {files_per_second:.1f} файлов/сек"
+        )
+        tracker.update_progress(processed_count, progress_msg, stats)
         
-        print(f"✅ Кэш сканирования успешно сохранен в {scan_cache_path}")
-        print(f"📊 Статистика: обработано {processed_count}, пропущено: мелких-{skipped_small}, пустых-{skipped_empty}, дубликатов-{skipped_dupes}")
-        return scan_cache_path
+        # Сохраняем чекпоинт после каждого пакета
+        if (batch_num + 1) % max(1, config.CHECKPOINT_INTERVAL // config.BATCH_SIZE_SCAN) == 0:
+            checkpoint_data = {
+                'doc_paths': doc_paths,
+                'doc_texts': doc_texts,
+                'doc_hashes': doc_hashes,
+                'stats': stats,
+                'processed_count': processed_count,
+                'batch_num': batch_num + 1,
+                'all_file_paths': all_file_paths,
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+            save_checkpoint(checkpoint_file, checkpoint_data)
+            print(f"Чекпоинт сохранен после пакета {batch_num+1}")
+            
+    # Сохраняем результаты
+    result_data = {
+        'doc_paths': doc_paths,
+        'texts': doc_texts,
+        'hashes': doc_hashes,
+        'stats': stats,
+        'timestamp': datetime.datetime.now().isoformat()
+    }
+    try:
+        with open(cache_path, 'wb') as f:
+            pickle.dump(result_data, f)
+        # Удаляем чекпоинт после успешного завершения
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
+        end_time = time.time()
+        save_timing_data("document_scanning", start_time, end_time, processed_count)
+        total_processed = stats['processed']
+        total_skipped = sum(v for k, v in stats.items() if k != 'processed' and k != 'file_types')
+        message = (
+            f"Сканирование успешно завершено за {format_time(end_time - start_time)}. "
+            f"Обработано: {total_processed}, пропущено: {total_skipped}. "
+            f"Файл кэша: {cache_filename}"
+        )
+        tracker.finish_task(message, stats)
+        print(message)
     except Exception as e:
-        scan_status.update({
-            'status': 'error',
-            'error_message': str(e),
-            'end_time': time.time()
-        })
-        print(f"❌ Ошибка при сканировании: {str(e)}")
-        raise
+        error_message = f"Ошибка сохранения кэша: {str(e)}"
+        tracker.finish_task(error_message, stats)
+        print(error_message)
 
 @app.route('/')
 def index():
-    """Главная страница с настройками сканирования"""
-    return render_template(
-        'scanner.html',
-        default_root_dir=str(DEFAULT_ROOT_DIR),
-        index_dir=str(INDEX_DIR),
-        min_file_size_kb=MIN_FILE_SIZE / 1024,
-        max_text_len=MAX_TEXT_LEN,
-        use_cache=USE_CACHE,
-        supported_exts=SUPPORTED_EXTS,
-        port=SCANNER_PORT,
-        current_year=time.localtime().tm_year
-    )
+    return render_template('scanner.html',
+                         default_dir=str(config.DEFAULT_ROOT_DIR),
+                         supported_exts=config.SUPPORTED_EXTS,
+                         min_file_size=config.MIN_FILE_SIZE,
+                         now=datetime.datetime.now()) 
 
-@app.route('/start_scan', methods=['POST'])
+@app.route('/start-scan', methods=['POST'])
 def start_scan():
-    """Запуск сканирования в отдельном потоке"""
-    global scan_status
-    if scan_status['status'] == 'scanning':
-        return jsonify({'success': False, 'message': 'Сканирование уже запущено'})
+    global scan_thread, stop_scan
+    # Сбрасываем флаг остановки
+    stop_scan.clear()
     
-    # Получение параметров из формы
-    try:
-        root_dir = request.form.get('root_dir', str(DEFAULT_ROOT_DIR))
-        index_dir = request.form.get('index_dir', str(INDEX_DIR))
-        min_file_size = int(float(request.form.get('min_file_size', MIN_FILE_SIZE/1024)) * 1024)
-        max_text_len = int(request.form.get('max_text_len', MAX_TEXT_LEN))
-        use_cache = 'use_cache' in request.form
-        
-        # Сброс статуса
-        scan_status.update({
-            'status': 'idle',
-            'progress': 0,
-            'current_file': '',
-            'total_files': 0,
-            'processed': 0,
-            'skipped_small': 0,
-            'skipped_empty': 0,
-            'skipped_dupes': 0,
-            'result_path': '',
-            'error_message': '',
-            'start_time': 0,
-            'end_time': 0
-        })
-        
-        # Запуск сканирования в отдельном потоке
-        threading.Thread(
-            target=scan_wrapper,
-            args=(root_dir, index_dir, min_file_size, max_text_len, use_cache),
-            daemon=True
-        ).start()
-        
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Ошибка в настройках: {str(e)}'})
+    root_dir = request.form.get('root_dir', str(config.DEFAULT_ROOT_DIR))
+    min_file_size = int(request.form.get('min_file_size', config.MIN_FILE_SIZE))
+    max_text_len = int(request.form.get('max_text_len', config.MAX_TEXT_LEN))
+    use_cache = request.form.get('use_cache', 'true') == 'true'
+    add_timestamp_raw = request.form.get('add_timestamp', 'true')
+    add_timestamp = add_timestamp_raw == 'true'
+    
+    # Запускаем сканирование в отдельном потоке
+    scan_thread = threading.Thread(
+        target=scan_documents,
+        args=(root_dir, min_file_size, max_text_len, use_cache, add_timestamp)
+    )
+    scan_thread.start()
+    return jsonify({'status': 'started', 'message': 'Сканирование запущено'})
 
-def scan_wrapper(root_dir, index_dir, min_file_size, max_text_len, use_cache):
-    """Обертка для обработки исключений в потоке сканирования"""
-    global scan_status
-    try:
-        scan_documents(root_dir, index_dir, min_file_size, max_text_len, use_cache)
-    except Exception as e:
-        scan_status.update({
-            'status': 'error',
-            'error_message': str(e),
-            'end_time': time.time()
-        })
+@app.route('/stop-scan', methods=['POST'])
+def stop_scan_route():
+    global stop_scan
+    stop_scan.set()
+    return jsonify({'status': 'stopped', 'message': 'Сканирование остановлено'})
 
-@app.route('/scan_status')
-def get_scan_status():
-    """Получение текущего статуса сканирования"""
-    global scan_status
-    # Вычисление примерного оставшегося времени
-    remaining_time = "-"
-    if scan_status['status'] == 'scanning' and scan_status['start_time'] > 0 and scan_status['processed'] > 0:
-        elapsed = time.time() - scan_status['start_time']
-        files_per_sec = scan_status['processed'] / elapsed if elapsed > 0 else 0
-        remaining_files = scan_status['total_files'] - scan_status['processed']
-        if files_per_sec > 0:
-            remaining_seconds = remaining_files / files_per_sec
-            if remaining_seconds < 60:
-                remaining_time = f"{int(remaining_seconds)} сек"
-            else:
-                remaining_time = f"{int(remaining_seconds/60)} мин"
-    return jsonify({
-        'status': scan_status['status'],
-        'progress': scan_status['progress'],
-        'current_file': scan_status['current_file'],
-        'total_files': scan_status['total_files'],
-        'processed': scan_status['processed'],
-        'skipped_small': scan_status['skipped_small'],
-        'skipped_empty': scan_status['skipped_empty'],
-        'skipped_dupes': scan_status['skipped_dupes'],
-        'remaining_time': remaining_time,
-        'result_path': scan_status['result_path'],
-        'error_message': scan_status['error_message'],
-        'start_time': scan_status['start_time'],
-        'end_time': scan_status['end_time']
-    })
+@app.route('/status')
+def status():
+    return jsonify(tracker.get_status())
 
-@app.route('/stop_scan', methods=['POST'])
-def stop_scan():
-    """Остановка сканирования"""
-    global scan_status
-    if scan_status['status'] == 'scanning':
-        scan_status['status'] = 'stopping'
-        return jsonify({'success': True, 'message': 'Сканирование останавливается...'})
-    return jsonify({'success': False, 'message': 'Сканирование не запущено'})
-
-def show_help():
-    """Показывает справку по использованию скрипта"""
-    print(f"""
-📚 Веб-интерфейс для создания кэша сканирования
-Использование:
-  python app.py
-Конфигурация:
-  Директория сканирования по умолчанию: {DEFAULT_ROOT_DIR}
-  Директория сохранения кэша: {INDEX_DIR}
-  Веб-сервер: http://{SCANNER_HOST}:{SCANNER_PORT}
-Поддерживаемые форматы файлов:
-  {', '.join(SUPPORTED_EXTS)}
-Минимальный размер файла: {MIN_FILE_SIZE / 1024} КБ
-Максимальная длина текста: {MAX_TEXT_LEN} символов
-Управление:
-  • Сервер запустится автоматически и откроет браузер
-  • Для остановки сервера нажмите Ctrl+C в консоли
-    """)
-
-def open_browser():
-    """Открывает браузер после запуска сервера"""
-    time.sleep(1)  # Ждем, пока сервер запустится
-    webbrowser.open(f'http://{SCANNER_HOST}:{SCANNER_PORT}')
+@app.route('/timing-history')
+def timing_history():
+    """Возвращает историю времени выполнения задач"""
+    timing_file = config.CACHE_DIR / "timing_history.json"
+    if timing_file.exists():
+        try:
+            with open(timing_file, 'r') as f:
+                timing_data = json.load(f)
+            return jsonify(timing_data[-10:])  # Последние 10 записей
+        except Exception as e:
+            return jsonify({'error': str(e)})
+    return jsonify([])
 
 if __name__ == '__main__':
-    # Проверка необходимых зависимостей для mobi и epub
-    try:
-        import ebooklib
-        from ebooklib import epub
-        print("✅ Поддержка формата EPUB доступна")
-    except ImportError:
-        print("⚠️ Библиотека ebooklib не установлена. Поддержка EPUB будет ограничена.")
+    script_dir = Path(__file__).parent
+    sys.path.insert(0, str(script_dir))
+    ensure_directories()
     
-    try:
-        import mobi
-        print("✅ Поддержка формата MOBI доступна")
-    except ImportError:
-        print("⚠️ Библиотека mobi не установлена. Поддержка MOBI будет ограничена.")
+    # Открываем браузер
+    webbrowser.open(f'http://{config.SCANNER_HOST}:{config.SCANNER_PORT}/')
     
-    # Показываем справку
-    show_help()
-    
-    # Создаем и запускаем поток для открытия браузера
-    browser_thread = threading.Thread(target=open_browser)
-    browser_thread.daemon = True
-    browser_thread.start()
-    
-    # Запуск Flask приложения
-    print(f"""
-🚀 Запуск веб-сервера сканера на http://{SCANNER_HOST}:{SCANNER_PORT}""")
-    print("Для остановки сервера нажмите Ctrl+C в консоли")
-    try:
-        app.run(host=SCANNER_HOST, port=SCANNER_PORT, debug=False, use_reloader=False)
-    except KeyboardInterrupt:
-        print("""
-🛑 Сервер остановлен пользователем""")
-    except Exception as e:
-        print(f"❌ Ошибка при запуске сервера: {str(e)}")
-        sys.exit(1)
+    # Запускаем сервер
+    app.run(host=config.SCANNER_HOST, port=config.SCANNER_PORT, debug=False)

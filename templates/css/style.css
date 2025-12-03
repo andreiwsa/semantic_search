@@ -1,11 +1,72 @@
-/* Все CSS стили из вашего текущего кода */
 body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    line-height: 1.6;
-    color: #333;
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 20px;
     background-color: #f8f9fa;
 }
-/* остальные стили */
+
+.card {
+    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+    border: 1px solid rgba(0, 0, 0, 0.125);
+}
+
+.navbar-brand {
+    font-weight: bold;
+}
+
+.footer {
+    margin-top: auto;
+    background-color: #e9ecef;
+}
+
+.result-item {
+    transition: box-shadow 0.15s ease-in-out;
+}
+
+.result-item:hover {
+    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+}
+
+.progress-bar {
+    transition: width 0.6s ease;
+}
+
+.badge {
+    font-size: 0.8em;
+}
+
+.btn {
+    margin-right: 5px;
+}
+
+.btn:last-child {
+    margin-right: 0;
+}
+
+.form-text {
+    color: #6c757d;
+    font-size: 0.875em;
+}
+
+.alert {
+    border-radius: 0.375rem;
+}
+
+.card-title {
+    font-size: 1.1rem;
+}
+
+.card-text {
+    font-size: 0.9rem;
+}
+
+@media (max-width: 768px) {
+    .container {
+        padding: 0 15px;
+    }
+    
+    .card {
+        margin-bottom: 15px;
+    }
+    
+    .btn {
+        margin-bottom: 5px;
+    }
+}

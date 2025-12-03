@@ -1,382 +1,333 @@
-import sys
 import os
+import sys
+import pickle
+import threading
 import time
 import numpy as np
-import faiss
-import pickle
 from pathlib import Path
-import torch
-from datetime import datetime
+from flask import Flask, render_template, request, jsonify, redirect, url_for, send_file
 import webbrowser
-import threading
-import json
-from flask import Flask, render_template, request, redirect, url_for, send_file, jsonify
+import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import INDEX_DIR, INDEX_FILE, PATHS_FILE, SEARCH_HOST, SEARCH_PORT, EMBEDDING_MODEL, PREVIEW_MAX_CHARS, SCANNER_HOST, SCANNER_PORT, EMBEDDING_HOST, EMBEDDING_PORT
-from document_processor import detect_format, extract_text, sanitize_filename, get_file_preview
+script_dir = Path(__file__).parent
+sys.path.insert(0, str(script_dir))
+import config
 from embeddings import load_embedding_model, generate_embeddings_with_embedding_model
+from document_processor import get_file_preview
+from utils import ensure_directories, format_time, save_timing_data
 
-# Инициализация Flask приложения
-app = Flask(__name__, template_folder='./templates')
-app.config['SECRET_KEY'] = 'your-secret-key-here'  # Измените на надежный ключ
+app = Flask(__name__)
+search_lock = threading.Lock()
 
-# Глобальные переменные для модели и индекса (загружаются один раз при старте)
-model = None
-index = None
+# Глобальные переменные для кэширования
+faiss_index = None
 doc_paths = None
-device = None
+model = None
+device = 'cpu'
+last_load_time = 0
 
-def load_model_and_index():
-    """Загружает модель BAAI/bge-m3 и индекс один раз при старте приложения"""
-    global model, index, doc_paths, device
-    print(f"=== ЗАГРУЗКА МОДЕЛИ {EMBEDDING_MODEL} И ИНДЕКСА ===")
-    start_time = time.time()
+def load_search_data(force_reload=False):
+    """Загрузка индекса и путей к документам с кэшированием"""
+    global faiss_index, doc_paths, model, device, last_load_time
     
-    # Пути к файлам индекса
-    index_path = Path(INDEX_DIR) / INDEX_FILE
-    paths_path = Path(INDEX_DIR) / PATHS_FILE
+    current_time = time.time()
     
-    # Проверка существования файлов индекса
-    if not index_path.exists():
-        print(f"❌ Файл индекса не найден: {index_path}")
-        print(f"Убедитесь, что вы правильно указали INDEX_DIR в конфигурации")
-        return False
-    
-    if not paths_path.exists():
-        print(f"❌ Файл метаданных не найден: {paths_path}")
-        print(f"Убедитесь, что вы правильно указали INDEX_DIR в конфигурации")
-        return False
-    
-    print(f"🔍 Загрузка индекса из: {INDEX_DIR}")
-    try:
-        # Загрузка индекса и метаданных
-        index = faiss.read_index(str(index_path))
-        with open(str(paths_path), 'rb') as f:
+    # Проверяем, нужно ли перезагружать данные (каждые 5 минут)
+    if not force_reload and current_time - last_load_time < 300 and faiss_index is not None:
+        return
+        
+    with search_lock:
+        # Проверяем наличие необходимых файлов
+        index_path = config.INDEX_DIR / config.INDEX_FILE
+        paths_path = config.INDEX_DIR / config.PATHS_FILE
+        
+        if not index_path.exists():
+            raise FileNotFoundError(f"Файл индекса не найден: {index_path}")
+        if not paths_path.exists():
+            raise FileNotFoundError(f"Файл путей к документам не найден: {paths_path}")
+            
+        # Загружаем FAISS индекс
+        import faiss
+        faiss_index = faiss.read_index(str(index_path))
+        
+        # Загружаем пути к документам
+        with open(paths_path, 'rb') as f:
             doc_paths = pickle.load(f)
+            
+        # Определяем устройство
+        import torch
+        device = 'cuda' if config.USE_FP16 and torch.cuda.is_available() else 'cpu'
         
-        print(f"✅ Загружено {len(doc_paths)} документов")
-        
-        # Определение устройства для вычислений
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"⚙️ Используемое устройство: {device}")
-        
-        # Загрузка модели BAAI/bge-m3 для генерации эмбеддингов
-        print(f"🧠 Загрузка модели: {EMBEDDING_MODEL}")
+        # Загружаем модель
         model = load_embedding_model(device)
         
-        load_time = time.time() - start_time
-        print(f"✅ Модель и индекс успешно загружены за {load_time:.2f} секунд")
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка при загрузке: {str(e)}")
-        return False
+        last_load_time = current_time
 
-def search_query_web(query: str, top_k: int = 5):
-    """Выполняет семантический поиск по заданному запросу для веб-интерфейса с использованием BAAI/bge-m3"""
-    global model, index, doc_paths, device
-    if model is None or index is None or doc_paths is None:
-        print("❌ Модель или индекс не загружены")
-        return None, None
+def semantic_search(query, top_k=10, threshold=0.3):
+    """Выполнение семантического поиска с измерением времени"""
+    global faiss_index, doc_paths, model
     
+    if faiss_index is None or doc_paths is None or model is None:
+        load_search_data()
+        
+    start_time = time.time()
+    
+    # Генерируем эмбеддинг для запроса
+    query_embedding = generate_embeddings_with_embedding_model(model, [query])[0]
+    query_embedding = query_embedding.reshape(1, -1).astype('float32')
+    
+    # Выполняем поиск
+    scores, indices = faiss_index.search(query_embedding, top_k)
+    search_time = time.time() - start_time
+    
+    results = []
+    for i in range(len(indices[0])):
+        score = scores[0][i]
+        idx = indices[0][i]
+        # Пропускаем результаты с низким сходством
+        if score < threshold:
+            continue
+        if idx < len(doc_paths):
+            doc_path = doc_paths[idx]
+            # Получаем превью файла
+            preview_start = time.time()
+            preview = get_file_preview(doc_path, config.PREVIEW_MAX_CHARS)
+            preview_time = time.time() - preview_start
+            
+            results.append({
+                'rank': i + 1,
+                'path': doc_path,
+                'preview': preview,
+                'score': float(score),
+                'filename': Path(doc_path).name,
+                'preview_time': preview_time
+            })
+    
+    total_time = time.time() - start_time
+    save_timing_data("semantic_search", start_time, time.time(), 1)
+    
+    return results, search_time, total_time
+
+@app.route('/')
+def index():
     try:
-        # Генерация эмбеддинга для запроса
+        load_search_data()
+        return render_template('search_form.html', 
+                             model_name=config.EMBEDDING_MODEL,
+                             device=device,
+                             total_docs=len(doc_paths) if doc_paths else 0,
+                             now=datetime.datetime.now())
+    except Exception as e:
+        return render_template('error.html', 
+                             error_message=f"Ошибка загрузки данных: {str(e)}",
+                             recommendations=[
+                                 "Проверьте, что индекс семантического поиска был создан",
+                                 "Убедитесь, что файлы semantic_index.faiss и doc_paths.pkl находятся в папке index_data",
+                                 "Запустите генератор эмбеддингов для создания индекса"
+                             ])
+
+@app.route('/', methods=['POST'])
+def search():
+    query = request.form.get('query', '')
+    top_k = int(request.form.get('top_k', 10))
+    threshold = float(request.form.get('threshold', 0.3))
+    
+    if not query.strip():
+        return render_template('search_form.html', error="Пожалуйста, введите поисковый запрос")
+        
+    try:
         start_time = time.time()
-        query_embedding = generate_embeddings_with_embedding_model(model, [query])
-        emb_time = time.time() - start_time
+        results, search_time, total_time = semantic_search(query, top_k, threshold)
         
-        # Поиск в индексе
-        start_time = time.time()
-        scores, indices = index.search(np.array(query_embedding), min(top_k, len(doc_paths)))
-        search_time = time.time() - start_time
+        # Форматируем время для отображения
+        search_time_formatted = format_time(search_time)
+        total_time_formatted = format_time(total_time)
+        avg_preview_time = sum(r['preview_time'] for r in results) / len(results) if results else 0
         
-        # Подготовка результатов
-        results = []
-        for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-            if idx < len(doc_paths) and score > 0.3:  # Порог сходства 0.3
-                doc_path = doc_paths[idx]
-                # Получаем краткое содержание файла
-                preview = get_file_preview(doc_path, PREVIEW_MAX_CHARS)
-                
-                # Определение формата файла для иконки
-                file_ext = Path(doc_path).suffix.lower()
-                if file_ext in ['.txt', '.text']:
-                    icon = '📄'
-                elif file_ext in ['.html', '.htm']:
-                    icon = '🌐'
-                elif file_ext in ['.docx', '.doc']:
-                    icon = '📝'
-                elif file_ext in ['.pdf']:
-                    icon = '📕'
-                elif file_ext in ['.epub']:
-                    icon = '📖'
-                elif file_ext in ['.mobi']:
-                    icon = '📓'
-                else:
-                    icon = '📄'
-                
-                results.append({
-                    "rank": i+1,
-                    "path": doc_path,
-                    "similarity": float(score),
-                    "preview": preview,
-                    "icon": icon,
-                    "relative_path": os.path.relpath(doc_path, start=os.path.dirname(doc_path))
-                })
-        
-        # Подготовка метаданных для отчета
-        metadata = {
-            "query": query,
-            "timestamp": datetime.now().isoformat(),
-            "total_documents_indexed": len(doc_paths),
-            "top_k_requested": top_k,
-            "results_count": len(results),
-            "model_used": EMBEDDING_MODEL,
-            "device_used": device,
-            "execution_time_seconds": {
-                "embedding_creation": emb_time,
-                "search": search_time,
-                "total": emb_time + search_time
-            }
+        # Сохраняем статистику поиска
+        search_stats = {
+            'query': query,
+            'results_count': len(results),
+            'search_time': search_time,
+            'total_time': total_time,
+            'avg_preview_time': avg_preview_time,
+            'timestamp': datetime.datetime.now().isoformat()
         }
         
-        return results, metadata
+        return render_template('search_results.html', 
+                             query=query,
+                             results=results,
+                             total_results=len(results),
+                             search_time=search_time_formatted,
+                             total_time=total_time_formatted,
+                             avg_preview_time=format_time(avg_preview_time),
+                             now=datetime.datetime.now()) 
     except Exception as e:
-        print(f"❌ Ошибка при поиске: {str(e)}")
-        return None, None
+        return render_template('error.html', 
+                             error_message=f"Ошибка поиска: {str(e)}",
+                             recommendations=[
+                                 "Проверьте подключение к интернету",
+                                 "Убедитесь, что модель эмбеддингов загружена корректно",
+                                 "Попробуйте перезапустить генератор эмбеддингов"
+                             ])
 
-@app.route('/', methods=['GET', 'POST'])
-def home():
-    """Главная страница с формой поиска"""
-    global doc_paths
-    if request.method == 'POST':
-        query = request.form.get('query', '').strip()
-        top_k = int(request.form.get('top_k', 5))
-        if not query:
-            return render_template('error.html', error="Пустой запрос. Пожалуйста, введите текст для поиска.")
-        
-        # Выполнение поиска
-        results, metadata = search_query_web(query, top_k)
-        if results is None:
-            return render_template('error.html', error="Ошибка при выполнении поиска. Проверьте логи сервера.")
-        
-        # Передаем текущее время для футера
-        current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-        return render_template(
-            'search_results.html', 
-            query=query,
-            results=results,
-            metadata=metadata,
-            show_header=True,
-            current_year=datetime.now().year,
-            current_time=current_time,
-            index_dir=str(INDEX_DIR),
-            host=SEARCH_HOST,
-            port=SEARCH_PORT,
-            scanner_host=SCANNER_HOST,
-            scanner_port=SCANNER_PORT,
-            embedding_host=EMBEDDING_HOST,
-            embedding_port=EMBEDDING_PORT,
-        )
-    
-    # GET запрос - показываем форму поиска
-    return render_template(
-        'search_form.html', 
-        index_dir=str(INDEX_DIR),
-        model_name=EMBEDDING_MODEL.split('/')[-1],
-        doc_count=len(doc_paths) if doc_paths else "Не загружено",
-        port=SEARCH_PORT,
-        current_year=datetime.now().year,
-        scanner_host=SCANNER_HOST,
-        scanner_port=SCANNER_PORT,
-        embedding_host=EMBEDDING_HOST,
-        embedding_port=EMBEDDING_PORT
-    )
-
-@app.route('/save-results')
+@app.route('/save-results', methods=['POST'])
 def save_results():
-    """Сохраняет результаты поиска в HTML файл"""
-    query = request.args.get('q', '').strip()
-    top_k = int(request.args.get('top_k', 5))
-    if not query:
-        return "❌ Пустой запрос", 400
+    query = request.form.get('query', '')
+    results_json = request.form.get('results', '[]')
+    search_time = request.form.get('search_time', '0')
+    total_time = request.form.get('total_time', '0')
     
-    # Выполнение поиска
-    results, metadata = search_query_web(query, top_k)
-    if results is None:
-        return "❌ Ошибка при выполнении поиска", 500
+    import json
+    results = json.loads(results_json)
     
-    # Генерация HTML-отчета без заголовка
-    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    html_report = render_template(
-        'search_results.html', 
-        query=query,
-        results=results,
-        metadata=metadata,
-        show_header=False,
-        current_year=datetime.now().year,
-        current_time=current_time,
-        index_dir=str(INDEX_DIR),
-        host=SEARCH_HOST,
-        port=SEARCH_PORT,
-        scanner_host=SCANNER_HOST,
-        scanner_port=SCANNER_PORT,
-        embedding_host=EMBEDDING_HOST,
-        embedding_port=EMBEDDING_PORT
-    )
+    # Создаем HTML файл с результатами
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"search_results_{timestamp}.html"
+    filepath = config.TEMP_DIR / filename
     
-    # Сохранение HTML-файла
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_query = sanitize_filename(query[:50])
-    report_filename = f"search_results_{timestamp}_{safe_query}.html"
-    report_path = Path(INDEX_DIR) / report_filename
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write(html_report)
-    
-    # Возвращаем файл для скачивания
-    return send_file(report_path, as_attachment=True, download_name=report_filename)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Результаты поиска: {query}</title>
+            <meta charset="utf-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .result {{ border: 1px solid #ddd; margin: 10px 0; padding: 15px; }}
+                .rank {{ font-weight: bold; color: #007acc; }}
+                .path {{ color: #666; font-size: 0.9em; }}
+                .preview {{ margin-top: 10px; white-space: pre-wrap; }}
+                .score {{ color: #009900; font-weight: bold; }}
+                .timing {{ 
+                    background-color: #f8f9fa; 
+                    padding: 10px; 
+                    margin: 15px 0; 
+                    border-radius: 5px;
+                    font-family: monospace;
+                }}
+            </style>
+        </head>
+        <body>
+            <h1>Результаты поиска: {query}</h1>
+            <p>Дата: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+            <div class="timing">
+                <strong>Время обработки:</strong><br>
+                Поиск в индексе: {search_time}<br>
+                Общее время (включая получение превью): {total_time}<br>
+                Количество результатов: {len(results)}
+            </div>
+        """)
+        
+        for result in results:
+            f.write(f"""
+            <div class="result">
+                <div class="rank">Ранг: {result['rank']}</div>
+                <div class="path">Путь: {result['path']}</div>
+                <div class="score">Сходство: {result['score']:.4f}</div>
+                <div class="preview">{result['preview']}</div>
+            </div>
+            """)
+            
+        f.write("""
+        </body>
+        </html>
+        """)
+        
+    return send_file(filepath, as_attachment=True)
 
 @app.route('/open-file', methods=['POST'])
 def open_file():
-    """Открывает файл или его директорию в проводнике"""
+    import subprocess
+    import platform
+    file_path = request.form.get('file_path', '')
+    if not file_path:
+        return jsonify({'error': 'Путь к файлу не указан'})
     try:
-        data = request.json
-        file_path = data.get('path', '')
-        if not file_path or not os.path.exists(file_path):
-            return jsonify({"success": False, "error": "Файл не найден"})
-        
-        # Открываем директорию с файлом
-        directory = os.path.dirname(file_path)
-        if sys.platform == 'win32':
-            os.startfile(directory)
-        elif sys.platform == 'darwin':
-            os.system(f'open "{directory}"')
-        else:
-            os.system(f'xdg-open "{directory}"')
-        
-        return jsonify({"success": True, "message": "Директория открыта"})
+        path = Path(file_path)
+        if platform.system() == 'Windows':
+            subprocess.run(['explorer', '/select,', str(path)], check=True)
+        elif platform.system() == 'Darwin':  # macOS
+            subprocess.run(['open', '-R', str(path)], check=True)
+        else:  # Linux
+            subprocess.run(['xdg-open', str(path.parent)], check=True)
+        return jsonify({'status': 'success', 'message': 'Папка открыта'})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return jsonify({'error': str(e)})
 
 @app.route('/open-document', methods=['POST'])
 def open_document():
-    """Открывает документ в системном приложении по умолчанию"""
+    import subprocess
+    import platform
+    file_path = request.form.get('file_path', '')
+    if not file_path:
+        return jsonify({'error': 'Путь к файлу не указан'})
     try:
-        data = request.json
-        file_path = data.get('path', '')
-        if not file_path or not os.path.exists(file_path):
-            return jsonify({"success": False, "error": "Файл не найден"})
-        
-        # Открываем файл в системном приложении по умолчанию
-        if sys.platform == 'win32':
-            os.startfile(file_path)
-        elif sys.platform == 'darwin':
-            os.system(f'open "{file_path}"')
-        else:
-            os.system(f'xdg-open "{file_path}"')
-        
-        return jsonify({"success": True, "message": "Документ открыт"})
+        path = Path(file_path)
+        if platform.system() == 'Windows':
+            os.startfile(str(path))
+        elif platform.system() == 'Darwin':  # macOS
+            subprocess.run(['open', str(path)], check=True)
+        else:  # Linux
+            subprocess.run(['xdg-open', str(path)], check=True)
+        return jsonify({'status': 'success', 'message': 'Документ открыт'})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return jsonify({'error': str(e)})
 
 @app.route('/status')
 def status():
-    """Проверка статуса сервиса"""
-    return jsonify({
-        "status": "online",
-        "index_dir": str(INDEX_DIR),
-        "documents_count": len(doc_paths) if doc_paths else 0,
-        "model_loaded": model is not None,
-        "model_name": EMBEDDING_MODEL,
-        "device": device,
-        "timestamp": datetime.now().isoformat()
-    })
+    try:
+        load_search_data()
+        return jsonify({
+            'status': 'ready',
+            'device': device,
+            'total_docs': len(doc_paths) if doc_paths else 0,
+            'model': config.EMBEDDING_MODEL,
+            'last_load_time': datetime.datetime.fromtimestamp(last_load_time).strftime("%Y-%m-%d %H:%M:%S")
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        })
 
-def open_browser():
-    """Открывает браузер после запуска сервера"""
-    time.sleep(1)  # Ждем, пока сервер запустится
-    webbrowser.open(f'http://{SEARCH_HOST}:{SEARCH_PORT}')
+@app.route('/reload-data', methods=['POST'])
+def reload_data():
+    """Принудительная перезагрузка данных поиска"""
+    try:
+        load_search_data(force_reload=True)
+        return jsonify({
+            'status': 'success',
+            'message': 'Данные успешно перезагружены',
+            'total_docs': len(doc_paths) if doc_paths else 0
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        })
 
-def show_help():
-    """Показывает справку по использованию скрипта"""
-    print(f"""
-📚 Семантический поиск с веб-интерфейсом ({EMBEDDING_MODEL})
-Использование:
-  python app.py
-Конфигурация:
-  INDEX_DIR = {INDEX_DIR}
-  Модель = {EMBEDDING_MODEL}
-  Веб-сервер: http://{SEARCH_HOST}:{SEARCH_PORT}
-Требуемые файлы индекса:
-  • {INDEX_FILE} (векторный индекс)
-  • {PATHS_FILE} (пути к документам)
-Поддерживаемые форматы файлов:
-  {', '.join(SUPPORTED_EXTS)}
-Особенности модели {EMBEDDING_MODEL}:
-  • Размерность векторов: 1024 (для BAAI/bge-m3)
-  • Максимальная длина последовательности: 8192 токена
-  • Поддержка 100+ языков
-Дополнительные возможности:
-  • Поддержка предпросмотра текстовых файлов, DOCX, PDF, EPUB и MOBI
-  • Максимальное количество результатов: 1000
-  • Открытие документов в приложениях по умолчанию
-Управление:
-  • Сервер запустится автоматически и откроет браузер
-  • Для остановки сервера нажмите Ctrl+C в консоли
-  • Результаты поиска можно сохранить в HTML файл через интерфейс
-Интеграция:
-  • API статуса: http://{SEARCH_HOST}:{SEARCH_PORT}/status
-  • Связь с другими компонентами системы:
-      Сканер документов: http://{SCANNER_HOST}:{SCANNER_PORT}
-      Генератор эмбеддингов: http://{EMBEDDING_HOST}:{EMBEDDING_PORT}
-    """)
+@app.route('/timing-stats')
+def timing_stats():
+    """Статистика времени выполнения операций"""
+    timing_file = config.CACHE_DIR / "timing_history.json"
+    if timing_file.exists():
+        try:
+            with open(timing_file, 'r') as f:
+                timing_data = json.load(f)
+            return jsonify(timing_data[-20:])  # Последние 20 записей
+        except Exception as e:
+            return jsonify({'error': str(e)})
+    return jsonify([])
 
 if __name__ == '__main__':
-    # Проверка необходимых зависимостей для mobi и epub
-    try:
-        import ebooklib
-        from ebooklib import epub
-        print("✅ Поддержка формата EPUB доступна")
-    except ImportError:
-        print("⚠️ Библиотека ebooklib не установлена. Предпросмотр EPUB будет ограничен.")
+    script_dir = Path(__file__).parent
+    sys.path.insert(0, str(script_dir))
+    ensure_directories()
     
-    try:
-        import mobi
-        print("✅ Поддержка формата MOBI доступна")
-    except ImportError:
-        print("⚠️ Библиотека mobi не установлена. Предпросмотр MOBI будет ограничен.")
+    # Открываем браузер
+    webbrowser.open(f'http://{config.SEARCH_HOST}:{config.SEARCH_PORT}/')
     
-    # Показываем справку
-    show_help()
-    
-    # Загружаем модель и индекс
-    if not load_model_and_index():
-        print("""
-💡 Советы по устранению проблем:""")
-        print(f"1. Проверьте правильность пути INDEX_DIR в конфигурации: {INDEX_DIR}")
-        print(f"2. Убедитесь, что файлы индекса существуют в указанной директории")
-        print(f"3. Для создания индекса используйте скрипт генератора эмбеддингов")
-        print("""
-❗ Для просмотра содержимого DOCX файлов установите: pip install python-docx
-❗ Для просмотра содержимого PDF файлов установите: pip install PyMuPDF
-❗ Для просмотра содержимого EPUB файлов установите: pip install EbookLib
-❗ Для просмотра содержимого MOBI файлов установите: pip install mobi""")
-        sys.exit(1)
-    
-    # Создаем и запускаем поток для открытия браузера
-    browser_thread = threading.Thread(target=open_browser)
-    browser_thread.daemon = True
-    browser_thread.start()
-    
-    # Запускаем Flask сервер
-    print(f"""
-🚀 Запуск веб-сервера на http://{SEARCH_HOST}:{SEARCH_PORT}""")
-    print("Для остановки сервера нажмите Ctrl+C в консоли")
-    try:
-        app.run(host=SEARCH_HOST, port=SEARCH_PORT, debug=False, use_reloader=False)
-    except KeyboardInterrupt:
-        print("""
-🛑 Сервер остановлен пользователем""")
-    except Exception as e:
-        print(f"❌ Ошибка при запуске сервера: {str(e)}")
-        sys.exit(1)
+    # Запускаем сервер
+    app.run(host=config.SEARCH_HOST, port=config.SEARCH_PORT, debug=False)

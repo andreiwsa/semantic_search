@@ -1,341 +1,339 @@
-{% extends "base.html" %}
-
-{% block title %}Генератор эмбеддингов (BGE-M3){% endblock %}
-
-{% block header_title %}🧠 Генератор эмбеддингов (BGE-M3){% endblock %}
-{% block header_subtitle %}Создание векторных представлений документов для семантического поиска{% endblock %}
-
-{% block extra_styles %}
-<style>
-    .nav-pills .nav-link.active {
-        background-color: #3498db;
-        border-color: #3498db;
-    }
-    .embedding {
-        background-color: #eaf7ea;
-        padding: 10px;
-        margin-top: 10px;
-        border-radius: 4px;
-        max-height: 300px;
-        overflow-y: auto;
-    }
-    .full-embedding {
-        max-height: 400px;
-        overflow-y: auto;
-        margin-top: 10px;
-        padding: 10px;
-        background-color: #f8f9fa;
-        border-radius: 4px;
-    }
-    .file-info {
-        margin-bottom: 15px;
-        padding-bottom: 15px;
-        border-bottom: 1px solid #eee;
-    }
-</style>
-{% endblock %}
-
-{% block content %}
-<div class="model-info">
-    <strong>Используемая модель:</strong> BAAI/bge-m3<br>
-    <strong>Особенности:</strong> Поддержка 100+ языков, работа с длинными документами до 8192 токенов, размерность эмбеддингов: 1024
-</div>
-
-<div class="card">
-    <div class="card-header bg-primary text-white">
-        <ul class="nav nav-pills card-header-pills" id="modeTabs" role="tablist">
-            <li class="nav-item" role="presentation">
-                <button class="nav-link active" id="single-tab" data-bs-toggle="tab" data-bs-target="#singleMode" type="button" role="tab" aria-controls="singleMode" aria-selected="true">🎯 Одиночные файлы</button>
-            </li>
-            <li class="nav-item" role="presentation">
-                <button class="nav-link" id="cache-tab" data-bs-toggle="tab" data-bs-target="#cacheMode" type="button" role="tab" aria-controls="cacheMode" aria-selected="false">📚 Из кэша сканирования</button>
-            </li>
-        </ul>
-    </div>
-    <div class="card-body">
-        <div class="tab-content" id="modeTabsContent">
-            <!-- Режим обработки одиночных файлов -->
-            <div class="tab-pane fade show active" id="singleMode" role="tabpanel" aria-labelledby="single-tab">
-                <div class="error" id="error-message" style="display:none;"></div>
-                <div class="form-group mb-3">
-                    <label for="file-upload" class="form-label">Выберите файлы для обработки (поддерживаются: {{ supported_exts_single|join(', ') }})</label>
-                    <input type="file" class="form-control" id="file-upload" name="files" multiple>
-                    <div class="form-text">Максимальный размер файла: 10 МБ</div>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Генератор эмбеддингов</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="#">Генератор эмбеддингов</a>
+        </div>
+    </nav>
+    
+    <div class="container mt-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Загрузка кэша сканирования</h5>
+            </div>
+            <div class="card-body">
+                <form id="processForm" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label for="cacheFile" class="form-label">Файл кэша сканирования</label>
+                        <input class="form-control" type="file" id="cacheFile" name="cache_file" accept=".pkl">
+                        <div class="form-text">
+                            Загрузите файл кэша, созданный сканером документов (.pkl)
+                        </div>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary" id="processBtn">Начать генерацию эмбеддингов</button>
+                    <button type="button" class="btn btn-danger" id="stopBtn" disabled>Остановить</button>
+                </form>
+            </div>
+        </div>
+        
+        <div class="card mt-4" id="progressCard" style="display: none;">
+            <div class="card-header">
+                <h5 class="mb-0">Прогресс генерации эмбеддингов</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <strong>Текущая задача:</strong>
+                        <span id="currentTask">-</span>
+                    </div>
                 </div>
-                <button class="btn btn-primary btn-lg w-100 mb-4" onclick="processSingleFiles()">Создать эмбеддинги</button>
-                <div class="result" id="single-result-container" style="display:none;">
-                    <h3 class="mb-3">Результаты обработки:</h3>
-                    <div id="single-results"></div>
+                
+                <div class="mb-3">
+                    <div class="progress">
+                        <div class="progress-bar" role="progressbar" id="progressBar" style="width: 0%"></div>
+                    </div>
+                    <div class="d-flex justify-content-between mt-1">
+                        <small id="progressText">0%</small>
+                        <small id="timeEstimate">Оставшееся время: -</small>
+                    </div>
+                </div>
+                
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <strong>Обработано текстов:</strong>
+                        <span id="processedCount">0</span>
+                    </div>
+                </div>
+                
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <strong>Затраченное время:</strong>
+                        <span id="elapsedTime">0с</span>
+                    </div>
+                </div>
+                
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <strong>Скорость обработки:</strong>
+                        <span id="processingSpeed">0 текстов/сек</span>
+                    </div>
+                </div>
+                
+                <div class="alert alert-info" id="statusMessage">Ожидание запуска...</div>
+            </div>
+        </div>
+        
+        <div class="card mt-4" id="timingHistoryCard" style="display: none;">
+            <div class="card-header">
+                <h5 class="mb-0">История производительности</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm" id="timingTable">
+                        <thead>
+                            <tr>
+                                <th>Задача</th>
+                                <th>Время</th>
+                                <th>Элементов</th>
+                                <th>Скорость</th>
+                                <th>Дата</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Данные будут добавлены через JavaScript -->
+                        </tbody>
+                    </table>
                 </div>
             </div>
-            <!-- Режим обработки кэша сканирования -->
-            <div class="tab-pane fade" id="cacheMode" role="tabpanel" aria-labelledby="cache-tab">
-                <div class="mb-4">
-                    <p class="mb-3">Загрузите файл кэша <code>scan_cache.pkl</code>, созданный скриптом сканирования, чтобы сгенерировать эмбеддинги для всех документов в коллекции.</p>
-                    <div class="form-group mb-3">
-                        <label for="cache-file" class="form-label">Файл кэша сканирования (.pkl)</label>
-                        <input type="file" class="form-control" id="cache-file" accept=".pkl">
+        </div>
+        
+        <div class="card mt-4">
+            <div class="card-header">
+                <h5 class="mb-0">Информация о системе</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-6">
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item">
+                                <strong>Модель эмбеддингов:</strong> 
+                                <span class="badge bg-secondary">{{ config.EMBEDDING_MODEL }}</span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Размер батча:</strong> 
+                                <span class="badge bg-secondary">{{ config.BATCH_SIZE_EMBEDDING }}</span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Использование FP16:</strong> 
+                                <span class="badge bg-{% if config.USE_FP16 %}success{% else %}secondary{% endif %}">
+                                    {% if config.USE_FP16 %}Да{% else %}Нет{% endif %}
+                                </span>
+                            </li>
+                        </ul>
                     </div>
-                    <button class="btn btn-success btn-lg w-100 mb-4" onclick="processCacheFile()">Обработать кэш</button>
-                </div>
-                <div class="card mt-4" id="cache-status-card" style="display:none;">
-                    <div class="card-header bg-info text-white">
-                        <h5 class="mb-0">📊 Статус обработки кэша</h5>
-                    </div>
-                    <div class="card-body">
-                        <div class="mb-3">
-                            <div class="d-flex justify-content-between">
-                                <span>Текущий статус:</span>
-                                <span id="cache-status-badge" class="status-badge bg-secondary">Ожидание</span>
-                            </div>
-                        </div>
-                        <div class="progress" style="display: none;" id="cache-progress-container">
-                            <div class="progress-bar progress-bar-striped progress-bar-animated" 
-                                 role="progressbar" id="cache-progress-bar" style="width: 0%">0%</div>
-                        </div>
-                        <div class="mt-3" id="cache-current-file-container" style="display: none;">
-                            <small>Текущий файл:</small>
-                            <p class="mb-0 text-truncate" id="cache-current-file" style="max-width: 100%;"></p>
-                        </div>
-                        <div class="mt-4" id="cache-stats-container" style="display: none;">
-                            <div class="row text-center">
-                                <div class="col-6">
-                                    <h5 id="cache-processed-count">0</h5>
-                                    <small class="text-muted">Обработано</small>
-                                </div>
-                                <div class="col-6">
-                                    <h5 id="cache-remaining-time">-</h5>
-                                    <small class="text-muted">Осталось</small>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="mt-4" id="cache-result-container" style="display: none;">
-                            <div class="alert alert-success">
-                                <h5 class="alert-heading">✅ Обработка завершена!</h5>
-                                <p>Эмбеддинги успешно сохранены в: <strong id="cache-result-path"></strong></p>
-                                <p>Всего обработано документов: <strong id="cache-total-processed">0</strong></p>
-                                <p>Время выполнения: <strong id="cache-execution-time">0</strong> секунд</p>
-                                <button class="btn btn-primary mt-3" id="download-cache-result">Скачать результат</button>
-                            </div>
-                        </div>
-                        <div class="mt-4" id="cache-error-container" style="display: none;">
-                            <div class="alert alert-danger">
-                                <h5 class="alert-heading">❌ Ошибка при обработке</h5>
-                                <p id="cache-error-message"></p>
-                            </div>
-                        </div>
+                    <div class="col-md-6">
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item">
+                                <strong>Суточный лимит работы:</strong> 
+                                <span class="badge bg-secondary">{{ config.MAX_DAILY_WORK_HOURS }} часов</span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Чекпоинтинг:</strong> 
+                                <span class="badge bg-success">Каждые {{ config.CHECKPOINT_INTERVAL }} файлов</span>
+                            </li>
+                            <li class="list-group-item">
+                                <strong>Память GPU:</strong>
+                                <span id="gpuMemory" class="badge bg-info">Проверка...</span>
+                            </li>
+                        </ul>
                     </div>
                 </div>
             </div>
         </div>
     </div>
-</div>
-{% endblock %}
-
-{% block extra_scripts %}
-<script>
-    let cacheInterval;
-    let isProcessingCache = false;
     
-    // Обработка одиночных файлов
-    async function processSingleFiles() {
-        const fileInput = document.getElementById('file-upload');
-        const files = fileInput.files;
-        const errorElement = document.getElementById('error-message');
-        const resultContainer = document.getElementById('single-result-container');
-        const resultsDiv = document.getElementById('single-results');
-        
-        // Очистка предыдущих результатов
-        errorElement.style.display = 'none';
-        resultContainer.style.display = 'none';
-        resultsDiv.innerHTML = '';
-        
-        if (files.length === 0) {
-            showError('Пожалуйста, выберите хотя бы один файл');
-            return;
-        }
-        
-        const formData = new FormData();
-        for (let i = 0; i < files.length; i++) {
-            formData.append('files', files[i]);
-        }
-        
-        try {
-            const response = await fetch('/generate_embeddings', {
-                method: 'POST',
-                body: formData
+    <footer class="footer mt-4 py-3 bg-light">
+        <div class="container text-center">
+            <span class="text-muted">Генератор эмбеддингов &copy; {{ now.year }}</span>
+        </div>
+    </footer>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            const progressCard = $('#progressCard');
+            const timingHistoryCard = $('#timingHistoryCard');
+            let processInterval;
+            let lastProcessedCount = 0;
+            let lastUpdateTime = Date.now();
+            
+            $('#processForm').on('submit', function(e) {
+                e.preventDefault();
+                
+                const formData = new FormData(this);
+                
+                // Скрываем карту истории времени при новом запуске
+                timingHistoryCard.hide();
+                
+                $.ajax({
+                    url: '/process-cache',
+                    method: 'POST',
+                    data: formData,
+                    processData: false,
+                    contentType: false,
+                    success: function(response) {
+                        if (response.status === 'started') {
+                            $('#processBtn').prop('disabled', true);
+                            $('#stopBtn').prop('disabled', false);
+                            progressCard.show();
+                            $('#statusMessage').removeClass('alert-danger alert-warning').addClass('alert-info').text('Генерация эмбеддингов запущена...');
+                            
+                            // Запускаем опрос статуса
+                            clearInterval(processInterval);
+                            processInterval = setInterval(updateStatus, 1000);
+                        } else if (response.error) {
+                            alert('Ошибка: ' + response.error);
+                        }
+                    },
+                    error: function(xhr) {
+                        alert('Ошибка: ' + xhr.responseText);
+                    }
+                });
             });
             
-            const data = await response.json();
+            $('#stopBtn').on('click', function() {
+                $.ajax({
+                    url: '/stop-generation',
+                    method: 'POST',
+                    success: function(response) {
+                        if (response.status === 'stopped') {
+                            $('#statusMessage').removeClass('alert-info alert-warning').addClass('alert-warning').text('Генерация остановлена. Сохранение прогресса...');
+                            // Продолжаем опрашивать статус для отображения сохранения чекпоинта
+                        }
+                    }
+                });
+            });
             
-            if (response.ok) {
-                // Отображение результатов
-                data.results.forEach(result => {
-                    const resultDiv = document.createElement('div');
-                    resultDiv.className = 'file-info';
+            function updateStatus() {
+                $.get('/status', function(data) {
+                    // Обновляем прогресс
+                    $('#progressBar').css('width', data.progress + '%').text(data.progress + '%');
+                    $('#progressText').text(data.progress + '%');
+                    $('#currentTask').text(data.current_task || '-');
+                    $('#processedCount').text(data.processed_items + ' из ' + data.total_items);
+                    $('#elapsedTime').text(data.elapsed_time_formatted || '0с');
                     
-                    if (result.error) {
-                        resultDiv.innerHTML = `<strong>${result.filename}</strong>: ${result.error}`;
-                    } else {
-                        const embeddingPreview = result.embedding.slice(0, 10).join(', ') + '...';
-                        resultDiv.innerHTML = `
-                            <strong>${result.filename}</strong> (${result.format.toUpperCase()}):
-                            <div class="mt-2">
-                                <span class="badge bg-info">Формат: ${result.format.toUpperCase()}</span>
-                                <span class="badge bg-secondary ms-2">Длина: ${result.text_length} символов</span>
-                            </div>
-                            <div class="embedding mt-2">
-                                <p class="mb-1"><strong>Размерность:</strong> ${result.embedding.length}</p>
-                                <p class="mb-1"><strong>Вектор эмбеддинга (первые 10 значений):</strong></p>
-                                <pre class="mb-0">[${embeddingPreview}]</pre>
-                                <button class="btn btn-sm btn-outline-primary mt-2" onclick="showFullEmbedding(this)">Показать полностью</button>
-                                <div class="full-embedding" style="display: none;">
-                                    <pre>${JSON.stringify(result.embedding, null, 2)}</pre>
-                                </div>
-                            </div>
-                        `;
+                    // Рассчитываем скорость обработки
+                    const currentTime = Date.now();
+                    const timeDiff = (currentTime - lastUpdateTime) / 1000; // в секундах
+                    const countDiff = data.processed_items - lastProcessedCount;
+                    
+                    if (timeDiff > 1 && countDiff > 0) {
+                        const speed = countDiff / timeDiff;
+                        $('#processingSpeed').text(speed.toFixed(1) + ' текстов/сек');
+                        lastProcessedCount = data.processed_items;
+                        lastUpdateTime = currentTime;
                     }
                     
-                    resultsDiv.appendChild(resultDiv);
+                    // Обновляем оставшееся время
+                    if (data.remaining_time > 0) {
+                        $('#timeEstimate').text('Оставшееся время: ' + data.remaining_time_formatted);
+                    }
+                    
+                    // Обновляем сообщение статуса
+                    if (data.message) {
+                        let alertClass = 'alert-info';
+                        if (data.status === 'completed') alertClass = 'alert-success';
+                        if (data.status === 'stopped' || data.status === 'error') alertClass = 'alert-warning';
+                        
+                        $('#statusMessage')
+                            .removeClass('alert-info alert-success alert-warning alert-danger')
+                            .addClass(alertClass)
+                            .html(data.message.replace(/\n/g, '<br>'));
+                    }
+                    
+                    // Проверяем статус для остановки опроса
+                    if (data.status === 'completed' || data.status === 'error') {
+                        clearInterval(processInterval);
+                        $('#processBtn').prop('disabled', false);
+                        $('#stopBtn').prop('disabled', true);
+                        
+                        // Загружаем историю производительности после завершения
+                        setTimeout(loadTimingHistory, 1000);
+                    }
+                    
+                    // Проверяем, нужно ли приостановить работу из-за лимита времени
+                    if (data.should_pause && data.status === 'running') {
+                        $('#statusMessage')
+                            .removeClass('alert-info alert-success alert-warning alert-danger')
+                            .addClass('alert-warning')
+                            .html('Система автоматически приостановит работу через 30 секунд из-за достижения суточного лимита времени. Прогресс будет сохранен.');
+                    }
                 });
-                
-                resultContainer.style.display = 'block';
-            } else {
-                showError(data.error || 'Произошла ошибка при обработке файлов');
             }
-        } catch (error) {
-            showError('Ошибка соединения с сервером: ' + error.message);
-        }
-    }
-    
-    function showError(message) {
-        const errorElement = document.getElementById('error-message');
-        errorElement.textContent = message;
-        errorElement.style.display = 'block';
-        errorElement.scrollIntoView({behavior: 'smooth'});
-    }
-    
-    function showFullEmbedding(button) {
-        const fullEmbeddingDiv = button.nextElementSibling;
-        if (fullEmbeddingDiv.style.display === 'none') {
-            fullEmbeddingDiv.style.display = 'block';
-            button.textContent = 'Скрыть';
-        } else {
-            fullEmbeddingDiv.style.display = 'none';
-            button.textContent = 'Показать полностью';
-        }
-    }
-    
-    // Обработка кэша сканирования
-    async function processCacheFile() {
-        const fileInput = document.getElementById('cache-file');
-        const file = fileInput.files[0];
-        
-        if (!file) {
-            alert('Пожалуйста, выберите файл кэша');
-            return;
-        }
-        
-        if (file.name !== 'scan_cache.pkl' && !file.name.endsWith('.pkl')) {
-            alert('Пожалуйста, выберите файл кэша в формате .pkl');
-            return;
-        }
-        
-        // Сброс состояния
-        document.getElementById('cache-status-card').style.display = 'block';
-        document.getElementById('cache-progress-container').style.display = 'none';
-        document.getElementById('cache-current-file-container').style.display = 'none';
-        document.getElementById('cache-stats-container').style.display = 'none';
-        document.getElementById('cache-result-container').style.display = 'none';
-        document.getElementById('cache-error-container').style.display = 'none';
-        
-        const formData = new FormData();
-        formData.append('cache_file', file);
-        
-        try {
-            const response = await fetch('/start_cache_processing', {
-                method: 'POST',
-                body: formData
-            });
             
-            const result = await response.json();
-            
-            if (result.success) {
-                isProcessingCache = true;
-                document.getElementById('cache-status-badge').className = 'status-badge bg-warning';
-                document.getElementById('cache-status-badge').textContent = 'Обработка';
-                document.getElementById('cache-progress-container').style.display = 'block';
-                document.getElementById('cache-current-file-container').style.display = 'block';
-                document.getElementById('cache-stats-container').style.display = 'block';
-                
-                // Запуск опроса статуса
-                clearInterval(cacheInterval);
-                cacheInterval = setInterval(updateCacheStatus, 1000);
-            } else {
-                showCacheError(result.message || 'Ошибка при запуске обработки кэша');
+            function loadTimingHistory() {
+                $.get('/timing-history', function(data) {
+                    if (data && data.length > 0) {
+                        timingHistoryCard.show();
+                        let tableBody = $('#timingTable tbody');
+                        tableBody.empty();
+                        
+                        data.forEach(item => {
+                            const date = new Date(item.timestamp);
+                            const formattedDate = date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+                            const speed = item.items_per_second ? item.items_per_second.toFixed(1) : '0.0';
+                            
+                            tableBody.append(`
+                                <tr>
+                                    <td>${item.task}</td>
+                                    <td>${formatDuration(item.duration)}</td>
+                                    <td>${item.items_processed}</td>
+                                    <td>${speed} эл/сек</td>
+                                    <td>${formattedDate}</td>
+                                </tr>
+                            `);
+                        });
+                    }
+                });
             }
-        } catch (error) {
-            showCacheError('Ошибка соединения с сервером: ' + error.message);
-        }
-    }
-    
-    function updateCacheStatus() {
-        if (!isProcessingCache) return;
-        
-        fetch('/cache_status')
-            .then(response => response.json())
-            .then(data => {
-                if (!data) return;
+            
+            function formatDuration(seconds) {
+                if (seconds < 0) seconds = 0;
+                const hours = Math.floor(seconds / 3600);
+                const minutes = Math.floor((seconds % 3600) / 60);
+                const secs = Math.floor(seconds % 60);
                 
-                document.getElementById('cache-progress-bar').style.width = data.progress + '%';
-                document.getElementById('cache-progress-bar').textContent = data.progress + '%';
-                document.getElementById('cache-current-file').textContent = data.current_file || 'Подготовка...';
-                document.getElementById('cache-processed-count').textContent = data.processed;
-                
-                if (data.status === 'completed') {
-                    finishCacheProcessing(data);
-                } else if (data.status === 'error') {
-                    showCacheError(data.error_message);
-                } else if (data.status === 'idle') {
-                    clearInterval(cacheInterval);
-                    isProcessingCache = false;
+                if (hours > 0) {
+                    return `${hours}ч ${minutes}м ${secs}с`;
+                } else if (minutes > 0) {
+                    return `${minutes}м ${secs}с`;
+                } else {
+                    return `${secs}с`;
                 }
-            })
-            .catch(error => {
-                console.error('Ошибка при получении статуса:', error);
-            });
-    }
-    
-    function finishCacheProcessing(data) {
-        clearInterval(cacheInterval);
-        isProcessingCache = false;
-        
-        document.getElementById('cache-status-badge').className = 'status-badge bg-success';
-        document.getElementById('cache-status-badge').textContent = 'Завершено';
-        document.getElementById('cache-progress-bar').className = 'progress-bar bg-success';
-        document.getElementById('cache-result-path').textContent = data.result_path;
-        document.getElementById('cache-total-processed').textContent = data.processed;
-        document.getElementById('cache-execution-time').textContent = (data.end_time - data.start_time).toFixed(1);
-        document.getElementById('cache-result-container').style.display = 'block';
-        
-        // Настройка кнопки скачивания
-        document.getElementById('download-cache-result').onclick = function() {
-            window.location.href = '/download_embeddings_cache';
-        };
-    }
-    
-    function showCacheError(message) {
-        clearInterval(cacheInterval);
-        isProcessingCache = false;
-        
-        document.getElementById('cache-status-badge').className = 'status-badge bg-danger';
-        document.getElementById('cache-status-badge').textContent = 'Ошибка';
-        document.getElementById('cache-error-message').textContent = message;
-        document.getElementById('cache-error-container').style.display = 'block';
-    }
-</script>
-{% endblock %}
-
-{% block footer_text %}
-Система создания эмбеддингов • {{ current_year }} • Порт: {{ port }}
-{% endblock %}
+            }
+            
+            function checkGpuMemory() {
+                // Для демонстрации эмулируем проверку памяти GPU
+                // В реальном приложении здесь был бы запрос к серверу для получения реальных данных
+                const usedMemory = Math.floor(Math.random() * 6) + 2; // 2-7 ГБ
+                const totalMemory = 8; // RTX 2070 имеет 8 ГБ
+                const percentage = Math.round((usedMemory / totalMemory) * 100);
+                
+                let badgeClass = 'bg-info';
+                if (percentage > 80) badgeClass = 'bg-danger';
+                else if (percentage > 60) badgeClass = 'bg-warning';
+                
+                $('#gpuMemory').removeClass('bg-info bg-warning bg-danger').addClass(badgeClass)
+                              .html(`${usedMemory} ГБ / ${totalMemory} ГБ (${percentage}%)`);
+                
+                // Повторяем проверку каждые 5 секунд
+                setTimeout(checkGpuMemory, 5000);
+            }
+            
+            // Запускаем проверку памяти GPU
+            checkGpuMemory();
+        });
+    </script>
+</body>
+</html>

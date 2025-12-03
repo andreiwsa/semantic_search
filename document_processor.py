@@ -1,246 +1,251 @@
+import os
+import sys
 import hashlib
 import re
+import html
+import mimetypes
 from pathlib import Path
-import os
+from bs4 import BeautifulSoup
+import docx2txt
+import fitz  # PyMuPDF
+from ebooklib import epub
+import zipfile
+import chardet  # Для детектирования кодировки
 
-def detect_format(file_path: Path):
+def detect_format(file_path):
     """Определение формата файла на основе расширения и содержимого"""
-    try:
-        ext = file_path.suffix.lower()
-        if ext in ['.txt', '.text']:
-            return 'txt'
-        elif ext in ['.html', '.htm']:
-            return 'html'
-        elif ext == '.docx':
-            return 'docx'
-        elif ext == '.doc':
-            return 'doc'
-        elif ext == '.pdf':
-            return 'pdf'
-        elif ext == '.epub':
-            return 'epub'
-        elif ext == '.mobi':
-            return 'mobi'
-        
-        # Анализ содержимого для файлов без расширения или с неизвестным расширением
-        raw = file_path.read_bytes(500)
-        if len(raw) == 0:
-            return None
-        
-        # DOCX: ZIP-архив → начинается с PK
-        if raw.startswith(b'PK\x03\x04') and b'word/' in raw[:500]:
-            return 'docx'
-        
-        # DOC: старый формат
-        if raw.startswith(b'\xD0\xCF\x11\xE0'):
-            return 'doc'
-        
-        # EPUB: тоже ZIP-архив
-        if raw.startswith(b'PK\x03\x04') and b'META-INF' in raw[:500]:
-            return 'epub'
-        
-        # Попытка декодировать как текст
+    path = Path(file_path)
+    # Проверяем по расширению
+    ext = path.suffix.lower()
+    if ext in ['.txt', '.text']:
+        return 'text'
+    elif ext in ['.html', '.htm']:
+        return 'html'
+    elif ext in ['.docx']:
+        return 'docx'
+    elif ext in ['.doc']:
+        return 'doc'
+    elif ext in ['.pdf']:
+        return 'pdf'
+    elif ext in ['.epub']:
+        return 'epub'
+    elif ext in ['.mobi']:
+        return 'mobi'
+    else:
+        # Если расширение неизвестно, определяем по MIME типу
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if mime_type:
+            if mime_type.startswith('text/'):
+                return 'text'
+            elif mime_type.startswith('application/pdf'):
+                return 'pdf'
+            elif mime_type == 'application/epub+zip':
+                return 'epub'
+        # Проверяем содержимое файла
         try:
-            text_sample = raw.decode('utf-8', errors='strict')
-        except UnicodeDecodeError:
-            return None
-        
-        # Проверка на HTML
-        lower_sample = text_sample.strip().lower()
-        if lower_sample.startswith(('<html', '<!doctype', '<head', '<meta', '<title')):
-            return 'html'
-        
-        return 'txt'
-    except Exception:
-        return None
+            with open(path, 'rb') as f:
+                sample = f.read(1024)
+            sample_str = sample.decode('utf-8', errors='ignore')
+            if '<html' in sample_str.lower() or '<head' in sample_str.lower():
+                return 'html'
+            elif sample_str.startswith('%PDF'):
+                return 'pdf'
+            elif b'PK\x03\x04' in sample and b'mimetype' in sample:
+                return 'epub'
+        except:
+            pass
+        return 'unknown'
 
-def extract_text(file_path: Path):
-    """Извлечение текста из файла на основе его формата"""
-    fmt = detect_format(file_path)
-    if not fmt:
-        return ''
+def detect_html_encoding(content_bytes):
+    """Попытка определить кодировку HTML из мета-тегов"""
     try:
-        if fmt == 'txt':
-            return file_path.read_text(encoding='utf-8', errors='ignore').strip()
-        elif fmt == 'html':
-            from bs4 import BeautifulSoup
-            raw = file_path.read_bytes()
-            soup = BeautifulSoup(raw, 'html.parser')
-            return soup.get_text(separator=' ', strip=True)
-        elif fmt == 'docx':
-            import docx2txt
-            return docx2txt.process(str(file_path)).strip()
-        elif fmt == 'doc':
-            # Упрощенная обработка DOC
-            raw = file_path.read_bytes()
-            cleaned = bytes(c for c in raw if 32 <= c <= 126 or c in (9, 10, 13))
-            return cleaned.decode('utf-8', errors='ignore').strip()
-        elif fmt == 'pdf':
-            import fitz  # PyMuPDF
-            doc = fitz.open(str(file_path))
+        # Конвертируем в строку для поиска мета-тегов
+        sample = content_bytes[:4096].decode('utf-8', errors='ignore').lower()
+        
+        # Поиск meta charset
+        import re
+        charset_match = re.search(r'<meta[^>]+charset=["\']?([^"\'\s>]+)', sample)
+        if charset_match:
+            return charset_match.group(1)
+        
+        # Поиск http-equiv
+        content_type_match = re.search(r'<meta[^>]+http-equiv=["\']?content-type["\']?[^>]+content=["\'][^"\']*charset=([^"\';]+)', sample)
+        if content_type_match:
+            return content_type_match.group(1)
+    except:
+        pass
+    return None
+
+def extract_text(file_path):
+    """Извлечение текста из файла в зависимости от формата"""
+    path = Path(file_path)
+    fmt = detect_format(path)
+    
+    if fmt == 'text':
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            try:
+                with open(path, 'r', encoding='cp1251') as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                with open(path, 'r', encoding='latin-1') as f:
+                    content = f.read()
+        return content
+        
+    elif fmt == 'html':
+        # Сначала пробуем прочитать как бинарный файл для детектирования кодировки
+        with open(path, 'rb') as f:
+            content_bytes = f.read()
+        
+        # Пытаемся определить кодировку из мета-тегов
+        detected_encoding = detect_html_encoding(content_bytes)
+        
+        # Если не удалось определить из мета-тегов, используем chardet
+        if not detected_encoding:
+            try:
+                detection = chardet.detect(content_bytes)
+                detected_encoding = detection['encoding']
+                confidence = detection['confidence']
+                if confidence < 0.7:  # Низкая уверенность
+                    detected_encoding = None
+            except:
+                detected_encoding = None
+        
+        # Попробуем различные кодировки
+        encodings_to_try = ['utf-8', 'cp1251', 'windows-1251', 'latin-1', 'cp1252']
+        
+        # Если определили кодировку, ставим ее первой
+        if detected_encoding:
+            encodings_to_try.insert(0, detected_encoding.lower())
+        
+        content = None
+        for encoding in encodings_to_try:
+            try:
+                # Некоторые кодировки могут иметь альтернативные названия
+                alt_encodings = {
+                    'windows-1251': 'cp1251',
+                    'windows-1252': 'cp1252'
+                }
+                encoding_to_use = alt_encodings.get(encoding.lower(), encoding)
+                
+                content = content_bytes.decode(encoding_to_use)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        
+        # Если ни одна кодировка не сработала, используем 'latin-1' как последний шанс
+        if content is None:
+            try:
+                content = content_bytes.decode('latin-1')
+            except:
+                # Если все попытки провалились, возвращаем пустую строку
+                print(f"Не удалось декодировать HTML файл: {file_path}")
+                return ""
+        
+        # Извлекаем текст из HTML
+        try:
+            soup = BeautifulSoup(content, 'html.parser')
+            text = soup.get_text()
+            return text
+        except Exception as e:
+            print(f"Ошибка при парсинге HTML {file_path}: {str(e)}")
+            return content  # Возвращаем исходный текст если парсинг не удался
+    
+    elif fmt == 'docx':
+        return docx2txt.process(str(path))
+    
+    elif fmt == 'doc':
+        # Для .doc используем antiword если доступен
+        import subprocess
+        try:
+            result = subprocess.run(['antiword', str(path)], 
+                                  capture_output=True, text=True, check=True)
+            return result.stdout
+        except Exception as e:
+            print(f"Ошибка обработки DOC файла {file_path}: {str(e)}")
+            return ""
+    
+    elif fmt == 'pdf':
+        try:
+            doc = fitz.open(str(path))
             text = ""
             for page in doc:
                 text += page.get_text()
             doc.close()
-            return text.strip()
-        elif fmt == 'epub':
-            from ebooklib import epub
-            from bs4 import BeautifulSoup
-            book = epub.read_epub(str(file_path))
+            return text
+        except Exception as e:
+            print(f"Ошибка обработки PDF файла {file_path}: {str(e)}")
+            return ""
+    
+    elif fmt == 'epub':
+        try:
+            book = epub.read_epub(str(path))
             text = ""
             for item in book.get_items():
-                if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                    soup = BeautifulSoup(item.get_content(), 'html.parser')
-                    text += soup.get_text(separator=' ', strip=True) + " "
-            return text.strip()
-        elif fmt == 'mobi':
+                if item.get_type() == epub.ITEM_DOCUMENT:
+                    content = item.get_content().decode('utf-8', errors='ignore')
+                    soup = BeautifulSoup(content, 'html.parser')
+                    text += soup.get_text() + "\n"
+            return text
+        except Exception as e:
+            print(f"Ошибка обработки EPUB файла {file_path}: {str(e)}")
+            return ""
+    
+    elif fmt == 'mobi':
+        try:
             import mobi
-            tempdir, filepath = mobi.extract(str(file_path))
-            try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                return content.strip()
-            finally:
-                # Очистка временных файлов
-                import shutil
-                shutil.rmtree(tempdir, ignore_errors=True)
-    except Exception as e:
-        print(f"⚠️ Ошибка при обработке {file_path}: {str(e)}")
-        return ''
+            tempdir, filepath = mobi.extract(str(path))
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            # Удаляем временные файлы
+            import shutil
+            shutil.rmtree(tempdir)
+            return content
+        except Exception as e:
+            print(f"Ошибка обработки MOBI файла {file_path}: {str(e)}")
+            return ""
+    
+    else:
+        return ""
 
 def get_file_hash(text):
-    """Генерация хеша для текста для определения дубликатов"""
+    """Генерация хеша для текста (для определения дубликатов)"""
     return hashlib.md5(text.encode('utf-8', errors='ignore')).hexdigest()
 
-def is_valid_file(file_path: Path, min_file_size: int):
-    """Проверка, является ли файл подходящим для обработки"""
-    if not file_path.is_file():
-        return False
-    # Проверка расширения
-    if file_path.suffix.lower() not in ['.txt', '.text', '.html', '.htm', '.docx', '.doc', '.pdf', '.epub', '.mobi']:
-        return False
-    # Проверка размера файла
-    if file_path.stat().st_size < min_file_size:
-        return False
-    return True
-
 def clean_text(text):
-    """Очистка текста от лишних пробелов и специальных символов"""
+    """Очистка текста от лишних символов"""
+    if not isinstance(text, str):
+        return ""
+    
     # Удаление лишних пробелов и переносов строк
-    text = re.sub(r'\s+', ' ', text).strip()
-    # Удаление специальных символов, оставляя только буквы, цифры и основные знаки препинания
-    text = re.sub(r'[^\w\s.,!?;:()\"\'\-—]', '', text)
-    return text
+    text = re.sub(r'\s+', ' ', text)
+    # Удаление HTML тегов
+    text = re.sub(r'<[^>]+>', '', text)
+    # Декодирование HTML entities
+    text = html.unescape(text)
+    return text.strip()
 
 def sanitize_filename(filename):
-    """Очищает имя файла от недопустимых символов"""
+    """Очистка имени файла от недопустимых символов"""
+    # Заменяем недопустимые символы
     invalid_chars = '<>:"/\\|?*'
     for char in invalid_chars:
         filename = filename.replace(char, '_')
-    return filename[:100]  # Ограничиваем длину имени файла
+    return filename
 
 def get_file_preview(file_path, max_chars=500):
-    """Возвращает краткое содержание файла для предварительного просмотра"""
+    """Получение превью содержимого файла"""
     try:
-        file_path = Path(file_path)
-        if not file_path.exists():
-            return "Файл не найден"
+        text = extract_text(file_path)
+        if not isinstance(text, str):
+            return "Не удалось получить превью"
         
-        # Попробуем разные кодировки для текстовых файлов
-        encodings = ['utf-8', 'cp1251', 'koi8-r', 'latin-1']
-        
-        # Обработка текстовых файлов
-        if file_path.suffix.lower() in ['.txt', '.text', '.md', '.log', '.csv', '.json', '.xml', '.html', '.htm']:
-            for encoding in encodings:
-                try:
-                    with open(file_path, 'r', encoding=encoding) as f:
-                        content = f.read(max_chars * 2)  # Читаем чуть больше, чтобы потом очистить
-                        # Удаляем специальные символы и лишние пробелы
-                        content = re.sub(r'\s+', ' ', content).strip()
-                        # Обрезаем до нужного количества символов
-                        preview = content[:max_chars]
-                        return preview + "..." if len(content) > max_chars else preview
-                except UnicodeDecodeError:
-                    continue
-            return "Не удалось прочитать содержимое файла с поддерживаемыми кодировками"
-        
-        # Для файлов DOCX
-        elif file_path.suffix.lower() in ['.docx', '.doc']:
-            try:
-                import docx
-                doc = docx.Document(str(file_path))
-                full_text = []
-                for para in doc.paragraphs:
-                    full_text.append(para.text)
-                content = ' '.join(full_text)
-                content = re.sub(r'\s+', ' ', content).strip()
-                preview = content[:max_chars]
-                return preview + "..." if len(content) > max_chars else preview
-            except ImportError:
-                return "Установите библиотеку python-docx для просмотра содержимого DOCX файлов"
-            except Exception as e:
-                return f"Ошибка при чтении DOCX файла: {str(e)}"
-        
-        # Для PDF файлов
-        elif file_path.suffix.lower() == '.pdf':
-            try:
-                import fitz  # PyMuPDF
-                doc = fitz.open(str(file_path))
-                text = ""
-                for page in doc:
-                    text += page.get_text()
-                    if len(text) > max_chars * 2:
-                        break
-                content = re.sub(r'\s+', ' ', text).strip()
-                preview = content[:max_chars]
-                return preview + "..." if len(content) > max_chars else preview
-            except ImportError:
-                return "Установите библиотеку PyMuPDF для просмотра содержимого PDF файлов"
-            except Exception as e:
-                return f"Ошибка при чтении PDF файла: {str(e)}"
-        
-        # Для EPUB файлов
-        elif file_path.suffix.lower() == '.epub':
-            try:
-                from ebooklib import epub
-                from bs4 import BeautifulSoup
-                book = epub.read_epub(str(file_path))
-                text = ""
-                for item in book.get_items():
-                    if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                        soup = BeautifulSoup(item.get_content(), 'html.parser')
-                        text += soup.get_text(separator=' ', strip=True) + " "
-                        if len(text) > max_chars * 2:
-                            break
-                content = re.sub(r'\s+', ' ', text).strip()
-                preview = content[:max_chars]
-                return preview + "..." if len(content) > max_chars else preview
-            except ImportError:
-                return "Установите библиотеку EbookLib для просмотра содержимого EPUB файлов"
-            except Exception as e:
-                return f"Ошибка при чтении EPUB файла: {str(e)}"
-        
-        # Для MOBI файлов
-        elif file_path.suffix.lower() == '.mobi':
-            try:
-                import mobi
-                tempdir, filepath = mobi.extract(str(file_path))
-                try:
-                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read(max_chars * 2)
-                    content = re.sub(r'\s+', ' ', content).strip()
-                    preview = content[:max_chars]
-                    return preview + "..." if len(content) > max_chars else preview
-                finally:
-                    # Очистка временных файлов
-                    import shutil
-                    shutil.rmtree(tempdir, ignore_errors=True)
-            except ImportError:
-                return "Установите библиотеку mobi для просмотра содержимого MOBI файлов"
-            except Exception as e:
-                return f"Ошибка при чтении MOBI файла: {str(e)}"
-        
-        # Для остальных типов файлов
-        return f"Предпросмотр для файлов типа {file_path.suffix} не поддерживается"
+        text = clean_text(text)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "..."
+        return text
     except Exception as e:
-        return f"Ошибка при получении предварительного просмотра: {str(e)}"
+        print(f"Ошибка получения превью для {file_path}: {str(e)}")
+        return "Не удалось получить превью"
